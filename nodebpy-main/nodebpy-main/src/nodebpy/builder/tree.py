@@ -1,0 +1,2143 @@
+from __future__ import annotations
+
+import warnings
+from collections import Counter
+from collections.abc import Collection, Iterator
+from contextlib import AbstractContextManager, contextmanager
+from contextvars import ContextVar
+from dataclasses import dataclass, field
+from pathlib import Path
+from typing import TYPE_CHECKING, Any, ClassVar, Literal, Self, TypeVar, cast
+
+import bpy
+from bpy.types import (
+    CompositorNodeTree,
+    GeometryNodeTree,
+    Node,
+    NodeFrame,
+    Nodes,
+    NodeSocket,
+    NodeTree,
+    ShaderNodeTree,
+)
+
+from ..layout import ArrangeMethod
+from ..layout import arrange as _arrange_nodes
+from ..layout import keep as _keep
+from ..types import (
+    SOCKET_COMPATIBILITY,
+    Default,
+    FloatInterfaceSubtypes,
+    IntegerInterfaceSubtypes,
+    StringInterfaceSubtypes,
+    VectorInterfaceSubtypes,
+    _AttributeDomains,
+    _SocketShapeStructureType,
+)
+from ._utils import (
+    InvalidLinkWarning,
+    SocketError,
+    _allow_innactive_sockets,
+    enum_value_error,
+    resolve_socket_key,
+    socket_key,
+)
+from .socket import (
+    BooleanSocket,
+    BundleSocket,
+    ClosureSocket,
+    CollectionSocket,
+    ColorSocket,
+    FloatSocket,
+    FontSocket,
+    GeometrySocket,
+    ImageSocket,
+    IntegerSocket,
+    MaterialSocket,
+    MatrixSocket,
+    MenuSocket,
+    ObjectSocket,
+    RotationSocket,
+    ShaderSocket,
+    Socket,
+    SoundSocket,
+    StringSocket,
+    VectorSocket,
+)
+
+if TYPE_CHECKING:
+    from ..live import GroupLinks, NodeAnimation
+
+_SocketT = TypeVar("_SocketT", bound=Socket)
+
+# What TreeBuilder's split_inputs=None resolves to; see `default_split_inputs`.
+_DEFAULT_SPLIT_INPUTS: ContextVar[bool] = ContextVar(
+    "nodebpy_default_split_inputs", default=False
+)
+
+
+@contextmanager
+def default_split_inputs(split: bool = True) -> Iterator[None]:
+    """Scope in which every ``TreeBuilder`` left at its default
+    ``split_inputs`` splits the Group Input node into one instance per
+    consumer node (with unused sockets hidden) on context exit.
+
+    An explicit ``split_inputs=True/False`` is unaffected, and so are trees
+    that disable auto-arrangement (as ``snapshot_positions`` dumps do).
+    """
+    token = _DEFAULT_SPLIT_INPUTS.set(split)
+    try:
+        yield
+    finally:
+        _DEFAULT_SPLIT_INPUTS.reset(token)
+
+
+# What TreeBuilder's keep_edits=None resolves to; see `default_keep_edits`.
+_DEFAULT_KEEP_EDITS: ContextVar[bool] = ContextVar(
+    "nodebpy_default_keep_edits", default=False
+)
+
+
+@contextmanager
+def default_keep_edits(keep: bool = True) -> Iterator[None]:
+    """Scope in which every ``TreeBuilder`` left at its default
+    ``keep_edits`` keeps the layout edits made to the tree it rebuilds with
+    ``clear=True`` (see :class:`TreeBuilder`). :func:`nodebpy.live.run_source`
+    runs its code in this scope.
+    """
+    token = _DEFAULT_KEEP_EDITS.set(keep)
+    try:
+        yield
+    finally:
+        _DEFAULT_KEEP_EDITS.reset(token)
+
+
+# Whether every TreeBuilder records what it built (see nodebpy.live.stamp_build),
+# not only the clear=True rebuilds; run_source sets it for the group classes
+# it rebuilds. Recording costs a pass over the nodes, so other builds skip it.
+_RECORD_BUILDS: ContextVar[bool] = ContextVar("nodebpy_record_builds", default=False)
+
+
+@contextmanager
+def _record_builds() -> Iterator[None]:
+    token = _RECORD_BUILDS.set(True)
+    try:
+        yield
+    finally:
+        _RECORD_BUILDS.reset(token)
+
+
+# Under run_source: each tree changed by hand that a clear=True rebuild
+# replaced, as (the rebuild, a copy of the changed tree). run_source settles
+# them once it has put its rebuilt groups in place of the old ones, which the
+# copies use too, so that a rebuild can be compared with the tree it replaced.
+_EDITED_COPIES: ContextVar[list[tuple[NodeTree, NodeTree]] | None] = ContextVar(
+    "nodebpy_edited_copies", default=None
+)
+
+
+@contextmanager
+def _defer_edited() -> Iterator[list[tuple[NodeTree, NodeTree]]]:
+    copies: list[tuple[NodeTree, NodeTree]] = []
+    token = _EDITED_COPIES.set(copies)
+    try:
+        yield copies
+    finally:
+        _EDITED_COPIES.reset(token)
+
+
+# The interface ``default_input`` values Blender actually accepts at runtime,
+# per socket type (the RNA enum lists every option on every type, but
+# assignment validates a per-type subset — union across tree types here).
+# Socket types not listed accept only "VALUE", so their factories don't take
+# the parameter at all.
+_FloatDefaultInputs = Literal["VALUE", "SCENE_FRAME"]
+_IntegerDefaultInputs = Literal["VALUE", "INDEX", "ID_OR_INDEX", "SCENE_FRAME"]
+_VectorDefaultInputs = Literal[
+    "VALUE",
+    "NORMAL",
+    "POSITION",
+    "HANDLE_LEFT",
+    "HANDLE_RIGHT",
+    "UNIFORM_IMAGE_COORDINATES",
+]
+_MatrixDefaultInputs = Literal["VALUE", "INSTANCE_TRANSFORM"]
+_ObjectDefaultInputs = Literal["VALUE", "SELF_OBJECT"]
+
+
+class PanelContext:
+    """Context manager for grouping sockets into a panel."""
+
+    def __init__(
+        self,
+        socket_context: SocketContext,
+        name: str,
+        *,
+        description: str = "",
+        default_closed: bool = False,
+    ):
+        self._socket_context = socket_context
+        self._name = name
+        self._description = description
+        self._default_closed = default_closed
+        self._panel: bpy.types.NodeTreeInterfacePanel | None = None
+
+    def __enter__(self) -> Self:
+        interface = self._socket_context.interface
+        self._panel = interface.new_panel(
+            self._name,
+            description=self._description,
+            default_closed=self._default_closed,
+        )
+        # Entered inside another panel context → nest under it.
+        self._previous = self._socket_context._active_panel
+        if self._previous is not None:
+            assert self._panel is not None
+            interface.move_to_parent(
+                self._panel, self._previous, len(self._previous.interface_items)
+            )
+        self._socket_context._active_panel = self._panel
+        return self
+
+    def __exit__(self, *args: object) -> None:
+        self._socket_context._active_panel = self._previous
+
+
+class TreePanelContext:
+    """Context manager for a panel holding both input *and* output sockets.
+
+    Activates the panel on the builder's ``inputs`` and ``outputs`` contexts
+    at once, and reuses an existing top-level panel of the same name — so a
+    mixed panel can be filled in two passes (inputs, then outputs) without
+    duplicating it."""
+
+    def __init__(
+        self,
+        builder: TreeBuilder[Any],
+        name: str | bpy.types.NodeTreeInterfacePanel,
+        *,
+        description: str = "",
+        default_closed: bool = False,
+        reuse: bool = True,
+    ):
+        self._builder = builder
+        self._name = name
+        self._description = description
+        self._default_closed = default_closed
+        self._reuse = reuse
+        self.panel: bpy.types.NodeTreeInterfacePanel | None = None
+
+    def __enter__(self) -> Self:
+        interface = self._builder.tree.interface
+        assert interface is not None
+        # Entered inside another panel context → nest under it. A mixed panel
+        # lives in one place, so an enclosing panel open on only one side
+        # (e.g. inside ``tree.outputs.panel(...)``) parents it too; two
+        # different panels open at once leave no sensible parent.
+        self._previous_inputs = self._builder.inputs._active_panel
+        self._previous_outputs = self._builder.outputs._active_panel
+        parent = self._previous_inputs or self._previous_outputs
+        if (
+            self._previous_inputs is not None
+            and self._previous_outputs is not None
+            and self._previous_inputs != self._previous_outputs
+        ):
+            raise ValueError(
+                f"Cannot nest mixed panel {self._name!r}: different panels "
+                f"are active for inputs ({self._previous_inputs.name!r}) and "
+                f"outputs ({self._previous_outputs.name!r})."
+            )
+
+        def parent_matches(item) -> bool:
+            if parent is None:
+                return item.parent is None or item.parent.index == -1
+            return item.parent == parent
+
+        if not isinstance(self._name, str):
+            # Reopening an exact panel by handle (e.g. the second direction
+            # pass of generated round-trip code, where a name lookup could
+            # land on a same-named sibling): activate it as it stands.
+            self.panel = self._name
+        else:
+            self.panel = None
+            if self._reuse:
+                self.panel = next(
+                    (
+                        item
+                        for item in interface.items_tree
+                        if getattr(item, "item_type", "") == "PANEL"
+                        and item.name == self._name
+                        and parent_matches(item)
+                    ),
+                    None,
+                )
+            if self.panel is None:
+                self.panel = interface.new_panel(
+                    self._name,
+                    description=self._description,
+                    default_closed=self._default_closed,
+                )
+                if parent is not None:
+                    interface.move_to_parent(
+                        self.panel, parent, len(parent.interface_items)
+                    )
+        self._builder.inputs._active_panel = self.panel
+        self._builder.outputs._active_panel = self.panel
+        return self
+
+    def __exit__(self, *args: object) -> None:
+        self._builder.inputs._active_panel = self._previous_inputs
+        self._builder.outputs._active_panel = self._previous_outputs
+
+
+class SocketContext:
+    _direction: Literal["INPUT", "OUTPUT"] | None
+
+    def __init__(self, tree_builder: TreeBuilder[Any]):
+        self.builder = tree_builder
+        self._active_panel: bpy.types.NodeTreeInterfacePanel | None = None
+
+    @property
+    def tree(self) -> NodeTree:
+        tree = self.builder.tree
+        assert tree is not None
+        return tree
+
+    @property
+    def interface(self) -> bpy.types.NodeTreeInterface:
+        interface = self.tree.interface
+        assert interface is not None
+        return interface
+
+    def panel(
+        self, name: str, *, description: str = "", default_closed: bool = False
+    ) -> PanelContext:
+        """Create a panel context for grouping sockets."""
+        return PanelContext(
+            self, name, description=description, default_closed=default_closed
+        )
+
+    # ------------------------------------------------------------------
+    # Socket factory methods
+    # ------------------------------------------------------------------
+
+    def _add_socket(
+        self, socket_type: str, name: str, description: str
+    ) -> bpy.types.NodeTreeInterfaceSocket:
+        kwargs: dict[str, Any] = {
+            "name": name,
+            "in_out": self._direction,
+            "socket_type": socket_type,
+        }
+        if self._active_panel is not None:
+            kwargs["parent"] = self._active_panel
+        interface_socket = self.interface.new_socket(**kwargs)
+        assert interface_socket is not None
+        interface_socket.description = description
+        return interface_socket
+
+    def _set_props(
+        self, interface_socket: bpy.types.NodeTreeInterfaceSocket, **kwargs: Any
+    ) -> None:
+        # ``force_non_field``'s RNA update callback recomputes the structure
+        # type, clobbering an already-assigned ``structure_type`` — apply it
+        # first, and skip the pointless (but still update-firing) False write.
+        if kwargs.get("force_non_field") is False:
+            kwargs.pop("force_non_field")
+        elif "force_non_field" in kwargs:
+            kwargs = {"force_non_field": kwargs.pop("force_non_field"), **kwargs}
+        for key, value in kwargs.items():
+            if value is None:
+                continue
+            if (
+                interface_socket.socket_type == "NodeSocketMenu"
+                and key == "default_value"
+            ):
+                self.builder._menu_defaults.append(
+                    _MenuDefault(interface_socket, value)
+                )
+            elif key == "default_attribute":
+                # the bpy property is named default_attribute_name
+                interface_socket.default_attribute_name = value
+            elif key == "default_input" and isinstance(value, Default):
+                interface_socket.default_input = value.value
+            else:
+                setattr(interface_socket, key, value)
+
+    def _wrap(
+        self,
+        socket_cls: type[_SocketT],
+        interface_socket: bpy.types.NodeTreeInterfaceSocket,
+    ) -> _SocketT:
+        if self._direction == "INPUT":
+            bpy_socket = self.builder._input_node().outputs[interface_socket.identifier]
+        else:
+            bpy_socket = self.builder._output_node().inputs[interface_socket.identifier]
+        s = socket_cls(bpy_socket)
+        s._tree = self.builder
+        s._interface_socket = interface_socket
+        # Captured while the reference is certainly fresh: interface items
+        # reallocate as the interface grows, so a later read through
+        # _interface_socket can hit a different item.
+        s._interface_identifier = interface_socket.identifier
+        return s
+
+    def float(
+        self,
+        name: str = "Value",
+        default_value: float = 0.0,  # ty: ignore[invalid-type-form]
+        description: str = "",
+        *,
+        min_value: float | None = None,  # ty: ignore[invalid-type-form]
+        max_value: float | None = None,  # ty: ignore[invalid-type-form]
+        optional_label: bool = False,
+        hide_value: bool = False,
+        hide_in_modifier: bool = False,
+        structure_type: _SocketShapeStructureType = "AUTO",
+        subtype: FloatInterfaceSubtypes = "NONE",
+        attribute_domain: _AttributeDomains = "POINT",
+        default_attribute: str | None = None,
+        force_non_field: bool = False,
+        default_input: _FloatDefaultInputs | Default = "VALUE",
+    ) -> FloatSocket:
+        iface = self._add_socket("NodeSocketFloat", name, description)
+        self._set_props(
+            iface,
+            default_value=default_value,
+            min_value=min_value,
+            max_value=max_value,
+            optional_label=optional_label,
+            hide_value=hide_value,
+            hide_in_modifier=hide_in_modifier,
+            structure_type=structure_type,
+            subtype=subtype,
+            attribute_domain=attribute_domain,
+            default_attribute=default_attribute,
+            force_non_field=force_non_field,
+            default_input=default_input,
+        )
+        return self._wrap(FloatSocket, iface)
+
+    def integer(
+        self,
+        name: str = "Integer",
+        default_value: int = 0,
+        description: str = "",
+        *,
+        min_value: int = -2147483648,
+        max_value: int = 2147483647,
+        optional_label: bool = False,
+        hide_value: bool = False,
+        hide_in_modifier: bool = False,
+        structure_type: _SocketShapeStructureType = "AUTO",
+        default_input: _IntegerDefaultInputs | Default = "VALUE",
+        subtype: IntegerInterfaceSubtypes = "NONE",
+        attribute_domain: _AttributeDomains = "POINT",
+        default_attribute: str | None = None,
+        force_non_field: bool = False,
+    ) -> IntegerSocket:
+        iface = self._add_socket("NodeSocketInt", name, description)
+        self._set_props(
+            iface,
+            default_value=default_value,
+            min_value=min_value,
+            max_value=max_value,
+            optional_label=optional_label,
+            hide_value=hide_value,
+            hide_in_modifier=hide_in_modifier,
+            structure_type=structure_type,
+            default_input=default_input,
+            subtype=subtype,
+            attribute_domain=attribute_domain,
+            default_attribute=default_attribute,
+            force_non_field=force_non_field,
+        )
+        return self._wrap(IntegerSocket, iface)
+
+    def boolean(
+        self,
+        name: str = "Boolean",
+        default_value: bool = False,
+        description: str = "",
+        *,
+        optional_label: bool = False,
+        hide_value: bool = False,
+        hide_in_modifier: bool = False,
+        structure_type: _SocketShapeStructureType = "AUTO",
+        layer_selection_field: bool = False,
+        attribute_domain: _AttributeDomains = "POINT",
+        default_attribute: str | None = None,
+        is_panel_toggle: bool = False,
+        force_non_field: bool = False,
+    ) -> BooleanSocket:
+        iface = self._add_socket("NodeSocketBool", name, description)
+        self._set_props(
+            iface,
+            default_value=default_value,
+            optional_label=optional_label,
+            hide_value=hide_value,
+            hide_in_modifier=hide_in_modifier,
+            structure_type=structure_type,
+            layer_selection_field=layer_selection_field,
+            attribute_domain=attribute_domain,
+            default_attribute=default_attribute,
+            is_panel_toggle=is_panel_toggle,
+            force_non_field=force_non_field,
+        )
+        return self._wrap(BooleanSocket, iface)
+
+    def vector(
+        self,
+        name: str = "Vector",
+        default_value: tuple[float, float]  # ty: ignore[invalid-type-form]
+        | tuple[float, float, float]  # ty: ignore[invalid-type-form]
+        | tuple[float, float, float, float]  # ty: ignore[invalid-type-form]
+        | None = None,
+        description: str = "",
+        *,
+        dimensions: Literal[2, 3, 4] = 3,
+        min_value: float | None = None,  # ty: ignore[invalid-type-form]
+        max_value: float | None = None,  # ty: ignore[invalid-type-form]
+        optional_label: bool = False,
+        hide_value: bool = False,
+        hide_in_modifier: bool = False,
+        structure_type: _SocketShapeStructureType = "AUTO",
+        subtype: VectorInterfaceSubtypes = "NONE",
+        default_attribute: str | None = None,
+        default_input: _VectorDefaultInputs | Default = "VALUE",
+        attribute_domain: _AttributeDomains = "POINT",
+        force_non_field: bool = False,
+    ) -> VectorSocket:
+        values: tuple[float, ...] = (
+            (0.0,) * dimensions if default_value is None else tuple(default_value)
+        )
+        assert len(values) == dimensions, "Default value length must match dimensions"
+        iface = self._add_socket("NodeSocketVector", name, description)
+        # The interface socket's default_value RNA is a fixed 3-float array
+        # regardless of `dimensions`; pad (or truncate) to length 3 to assign.
+        rna_default = (values + (0.0, 0.0, 0.0))[:3]
+        self._set_props(
+            iface,
+            dimensions=dimensions,
+            default_value=rna_default,
+            min_value=min_value,
+            max_value=max_value,
+            optional_label=optional_label,
+            hide_value=hide_value,
+            hide_in_modifier=hide_in_modifier,
+            structure_type=structure_type,
+            subtype=subtype,
+            default_input=default_input,
+            default_attribute=default_attribute,
+            attribute_domain=attribute_domain,
+            force_non_field=force_non_field,
+        )
+        return self._wrap(VectorSocket, iface)
+
+    def color(
+        self,
+        name: str = "Color",
+        default_value: tuple[float, float, float, float] = (1.0, 1.0, 1.0, 1.0),  # ty: ignore[invalid-type-form]
+        description: str = "",
+        *,
+        optional_label: bool = False,
+        hide_value: bool = False,
+        hide_in_modifier: bool = False,
+        structure_type: _SocketShapeStructureType = "AUTO",
+        attribute_domain: _AttributeDomains = "POINT",
+        default_attribute: str | None = None,
+        force_non_field: bool = False,
+    ) -> ColorSocket:
+        assert len(default_value) == 4, "Default color must be RGBA tuple"
+        iface = self._add_socket("NodeSocketColor", name, description)
+        self._set_props(
+            iface,
+            default_value=default_value,
+            optional_label=optional_label,
+            hide_value=hide_value,
+            hide_in_modifier=hide_in_modifier,
+            structure_type=structure_type,
+            attribute_domain=attribute_domain,
+            default_attribute=default_attribute,
+            force_non_field=force_non_field,
+        )
+        return self._wrap(ColorSocket, iface)
+
+    def rotation(
+        self,
+        name: str = "Rotation",
+        default_value: tuple[float, float, float] = (0.0, 0.0, 0.0),  # ty: ignore[invalid-type-form]
+        description: str = "",
+        *,
+        optional_label: bool = False,
+        hide_value: bool = False,
+        hide_in_modifier: bool = False,
+        structure_type: _SocketShapeStructureType = "AUTO",
+        attribute_domain: _AttributeDomains = "POINT",
+        default_attribute: str | None = None,
+        force_non_field: bool = False,
+    ) -> RotationSocket:
+        iface = self._add_socket("NodeSocketRotation", name, description)
+        self._set_props(
+            iface,
+            default_value=default_value,
+            optional_label=optional_label,
+            hide_value=hide_value,
+            hide_in_modifier=hide_in_modifier,
+            structure_type=structure_type,
+            attribute_domain=attribute_domain,
+            default_attribute=default_attribute,
+            force_non_field=force_non_field,
+        )
+        return self._wrap(RotationSocket, iface)
+
+    def matrix(
+        self,
+        name: str = "Matrix",
+        description: str = "",
+        *,
+        optional_label: bool = False,
+        hide_value: bool = False,
+        hide_in_modifier: bool = False,
+        structure_type: _SocketShapeStructureType = "AUTO",
+        default_input: _MatrixDefaultInputs | Default = "VALUE",
+        attribute_domain: _AttributeDomains = "POINT",
+        default_attribute: str | None = None,
+        force_non_field: bool = False,
+    ) -> MatrixSocket:
+        iface = self._add_socket("NodeSocketMatrix", name, description)
+        self._set_props(
+            iface,
+            optional_label=optional_label,
+            hide_value=hide_value,
+            hide_in_modifier=hide_in_modifier,
+            structure_type=structure_type,
+            default_input=default_input,
+            attribute_domain=attribute_domain,
+            default_attribute=default_attribute,
+            force_non_field=force_non_field,
+        )
+        return self._wrap(MatrixSocket, iface)
+
+    def string(
+        self,
+        name: str = "String",
+        default_value: str = "",
+        description: str = "",
+        *,
+        optional_label: bool = False,
+        hide_value: bool = False,
+        hide_in_modifier: bool = False,
+        subtype: StringInterfaceSubtypes = "NONE",
+        structure_type: _SocketShapeStructureType = "AUTO",
+        force_non_field: bool = False,
+    ) -> StringSocket:
+        iface = self._add_socket("NodeSocketString", name, description)
+        self._set_props(
+            iface,
+            default_value=default_value,
+            optional_label=optional_label,
+            hide_value=hide_value,
+            hide_in_modifier=hide_in_modifier,
+            subtype=subtype,
+            structure_type=structure_type,
+            force_non_field=force_non_field,
+        )
+        return self._wrap(StringSocket, iface)
+
+    def menu(
+        self,
+        name: str = "Menu",
+        default_value: str | None = None,
+        description: str = "",
+        *,
+        expanded: bool = False,
+        optional_label: bool = False,
+        hide_value: bool = False,
+        hide_in_modifier: bool = False,
+        structure_type: _SocketShapeStructureType = "AUTO",
+        force_non_field: bool = False,
+    ) -> MenuSocket:
+        iface = self._add_socket("NodeSocketMenu", name, description)
+        self._set_props(
+            iface,
+            default_value=default_value,
+            menu_expanded=expanded,
+            optional_label=optional_label,
+            hide_value=hide_value,
+            hide_in_modifier=hide_in_modifier,
+            structure_type=structure_type,
+            force_non_field=force_non_field,
+        )
+        return self._wrap(MenuSocket, iface)
+
+    def object(
+        self,
+        name: str = "Object",
+        default_value: bpy.types.Object | None = None,
+        description: str = "",
+        *,
+        optional_label: bool = False,
+        hide_value: bool = False,
+        hide_in_modifier: bool = False,
+        structure_type: _SocketShapeStructureType = "AUTO",
+        force_non_field: bool = False,
+        default_input: _ObjectDefaultInputs | Default = "VALUE",
+    ) -> ObjectSocket:
+        iface = self._add_socket("NodeSocketObject", name, description)
+        self._set_props(
+            iface,
+            default_value=default_value,
+            optional_label=optional_label,
+            hide_value=hide_value,
+            hide_in_modifier=hide_in_modifier,
+            structure_type=structure_type,
+            force_non_field=force_non_field,
+            default_input=default_input,
+        )
+        return self._wrap(ObjectSocket, iface)
+
+    def geometry(
+        self,
+        name: str = "Geometry",
+        description: str = "",
+        *,
+        optional_label: bool = False,
+        hide_value: bool = False,
+        hide_in_modifier: bool = False,
+        structure_type: _SocketShapeStructureType = "AUTO",
+        force_non_field: bool = False,
+    ) -> GeometrySocket:
+        iface = self._add_socket("NodeSocketGeometry", name, description)
+        self._set_props(
+            iface,
+            optional_label=optional_label,
+            hide_value=hide_value,
+            hide_in_modifier=hide_in_modifier,
+            structure_type=structure_type,
+            force_non_field=force_non_field,
+        )
+        return self._wrap(GeometrySocket, iface)
+
+    def collection(
+        self,
+        name: str = "Collection",
+        default_value: bpy.types.Collection | None = None,
+        description: str = "",
+        *,
+        optional_label: bool = False,
+        hide_value: bool = False,
+        hide_in_modifier: bool = False,
+        structure_type: _SocketShapeStructureType = "AUTO",
+        force_non_field: bool = False,
+    ) -> CollectionSocket:
+        iface = self._add_socket("NodeSocketCollection", name, description)
+        self._set_props(
+            iface,
+            default_value=default_value,
+            optional_label=optional_label,
+            hide_value=hide_value,
+            hide_in_modifier=hide_in_modifier,
+            structure_type=structure_type,
+            force_non_field=force_non_field,
+        )
+        return self._wrap(CollectionSocket, iface)
+
+    def image(
+        self,
+        name: str = "Image",
+        default_value: bpy.types.Image | None = None,
+        description: str = "",
+        *,
+        optional_label: bool = False,
+        hide_value: bool = False,
+        hide_in_modifier: bool = False,
+        structure_type: _SocketShapeStructureType = "AUTO",
+        force_non_field: bool = False,
+    ) -> ImageSocket:
+        iface = self._add_socket("NodeSocketImage", name, description)
+        self._set_props(
+            iface,
+            default_value=default_value,
+            optional_label=optional_label,
+            hide_value=hide_value,
+            hide_in_modifier=hide_in_modifier,
+            structure_type=structure_type,
+            force_non_field=force_non_field,
+        )
+        return self._wrap(ImageSocket, iface)
+
+    def material(
+        self,
+        name: str = "Material",
+        default_value: bpy.types.Material | None = None,
+        description: str = "",
+        *,
+        optional_label: bool = False,
+        hide_value: bool = False,
+        hide_in_modifier: bool = False,
+        structure_type: _SocketShapeStructureType = "AUTO",
+        force_non_field: bool = False,
+    ) -> MaterialSocket:
+        iface = self._add_socket("NodeSocketMaterial", name, description)
+        self._set_props(
+            iface,
+            default_value=default_value,
+            optional_label=optional_label,
+            hide_value=hide_value,
+            hide_in_modifier=hide_in_modifier,
+            structure_type=structure_type,
+            force_non_field=force_non_field,
+        )
+        return self._wrap(MaterialSocket, iface)
+
+    def font(
+        self,
+        name: str = "Font",
+        default_value: bpy.types.VectorFont | None = None,
+        description: str = "",
+        *,
+        optional_label: bool = False,
+        hide_value: bool = False,
+        hide_in_modifier: bool = False,
+    ) -> FontSocket:
+        iface = self._add_socket("NodeSocketFont", name, description)
+        self._set_props(
+            iface,
+            default_value=default_value,
+            optional_label=optional_label,
+            hide_value=hide_value,
+            hide_in_modifier=hide_in_modifier,
+        )
+        return self._wrap(FontSocket, iface)
+
+    def sound(
+        self,
+        name: str = "Sound",
+        default_value: bpy.types.Sound | None = None,
+        description: str = "",
+        *,
+        optional_label: bool = False,
+        hide_value: bool = False,
+        hide_in_modifier: bool = False,
+    ) -> SoundSocket:
+        iface = self._add_socket("NodeSocketSound", name, description)
+        self._set_props(
+            iface,
+            default_value=default_value,
+            optional_label=optional_label,
+            hide_value=hide_value,
+            hide_in_modifier=hide_in_modifier,
+        )
+        return self._wrap(SoundSocket, iface)
+
+    def bundle(
+        self,
+        name: str = "Bundle",
+        description: str = "",
+        *,
+        optional_label: bool = False,
+        hide_value: bool = False,
+        hide_in_modifier: bool = False,
+        structure_type: _SocketShapeStructureType = "AUTO",
+        force_non_field: bool = False,
+    ) -> BundleSocket:
+        iface = self._add_socket("NodeSocketBundle", name, description)
+        self._set_props(
+            iface,
+            optional_label=optional_label,
+            hide_value=hide_value,
+            hide_in_modifier=hide_in_modifier,
+            structure_type=structure_type,
+            force_non_field=force_non_field,
+        )
+        return self._wrap(BundleSocket, iface)
+
+    def closure(
+        self,
+        name: str = "Closure",
+        description: str = "",
+        *,
+        optional_label: bool = False,
+        hide_value: bool = False,
+        hide_in_modifier: bool = False,
+        structure_type: _SocketShapeStructureType = "AUTO",
+        force_non_field: bool = False,
+    ) -> ClosureSocket:
+        iface = self._add_socket("NodeSocketClosure", name, description)
+        self._set_props(
+            iface,
+            optional_label=optional_label,
+            hide_value=hide_value,
+            hide_in_modifier=hide_in_modifier,
+            structure_type=structure_type,
+            force_non_field=force_non_field,
+        )
+        return self._wrap(ClosureSocket, iface)
+
+    def shader(
+        self,
+        name: str = "Shader",
+        description: str = "",
+        *,
+        optional_label: bool = False,
+        hide_value: bool = False,
+        hide_in_modifier: bool = False,
+        structure_type: _SocketShapeStructureType = "AUTO",
+        force_non_field: bool = False,
+    ) -> ShaderSocket:
+        iface = self._add_socket("NodeSocketShader", name, description)
+        self._set_props(
+            iface,
+            optional_label=optional_label,
+            hide_value=hide_value,
+            hide_in_modifier=hide_in_modifier,
+            structure_type=structure_type,
+            force_non_field=force_non_field,
+        )
+        return self._wrap(ShaderSocket, iface)
+
+    def __len__(self) -> int:
+        assert self.tree.interface is not None
+        return len(
+            [
+                item
+                for item in self.tree.interface.items_tree
+                if isinstance(item, bpy.types.NodeTreeInterfaceSocket)
+                and item.in_out == self._direction
+            ]
+        )
+
+
+class DirectionalContext(SocketContext):
+    """Base class for directional socket contexts"""
+
+    _direction = "INPUT"
+
+
+class InputInterfaceContext(DirectionalContext):
+    _direction = "INPUT"
+
+
+class OutputInterfaceContext(DirectionalContext):
+    _direction = "OUTPUT"
+
+
+@dataclass
+class _MenuDefault:
+    """A menu default deferred to context exit, with enough breadcrumbs to
+    re-resolve its target — the reference captured at queue time is
+    invalidated by the interface update that populates the menu enums."""
+
+    item: bpy.types.NodeSocketMenu | bpy.types.NodeTreeInterfaceSocketMenu
+    default: str
+    # Interface references go stale as the interface grows, so a caller that
+    # captured the identifier while the reference was fresh passes it in;
+    # otherwise it is read here, at queue time.
+    identifier: str = ""
+    node_name: str | None = field(init=False, default=None)
+
+    def __post_init__(self) -> None:
+        if not self.identifier:
+            self.identifier = self.item.identifier
+            node = getattr(self.item, "node", None)  # sockets only
+            self.node_name = node.name if node is not None else None
+
+    def resolve(self, tree: NodeTree):
+        """The live menu socket/interface item this default targets.
+
+        Interface items are re-resolved by identifier — the interface update
+        that populates the enums reallocates them, leaving the queued
+        reference stale. A node socket keeps its direct reference (its node
+        may have been *renamed* since queueing, so the name breadcrumb could
+        hit a different same-named node); the breadcrumbs are only its
+        fallback if the socket itself was removed."""
+        if self.node_name is None:
+            interface = tree.interface
+            assert interface is not None
+            return next(
+                (
+                    item
+                    for item in interface.items_tree
+                    if getattr(item, "identifier", None) == self.identifier
+                ),
+                None,
+            )
+        try:
+            if self.item.identifier == self.identifier:
+                return self.item
+        except ReferenceError:  # pragma: no cover - the socket was removed
+            pass
+        return self._resolve_by_breadcrumbs(tree)  # pragma: no cover
+
+    def _resolve_by_breadcrumbs(self, tree: NodeTree):  # pragma: no cover
+        """Fallback for a removed/stale socket reference: re-find the socket
+        via its node name and identifier."""
+        assert self.node_name is not None
+        node = tree.nodes.get(self.node_name)
+        if node is None:
+            return None
+        return next((s for s in node.inputs if s.identifier == self.identifier), None)
+
+
+# One node's layout-snapshot record: (bl_idname, (x, y), parent frame name,
+# incoming links as (own input socket key, source node name, source socket
+# key)) — socket keys per :func:`socket_key`, stable across a rebuild where
+# identifiers are not.
+type _LayoutEntry = tuple[
+    str,
+    tuple[float, float],
+    str | None,
+    tuple[tuple[str, str, str], ...],
+]
+
+# One piece of matching evidence: a link as (own socket id, is_output, peer's
+# authored name, peer socket id), or ("parent", frame's authored name) /
+# ("child", child's authored name) for frame membership.
+type _Evidence = tuple[str, bool, str, str] | tuple[str, str]
+
+
+_IO_BL_IDNAMES = frozenset({"NodeGroupInput", "NodeGroupOutput"})
+
+
+def _sub_multiset(smaller: Counter, larger: Counter) -> bool:
+    return all(count <= larger[key] for key, count in smaller.items())
+
+
+def _match_layout_snapshot(
+    tree: NodeTree, entries: dict[str, _LayoutEntry]
+) -> list[tuple[Node, str]]:
+    """Match the tree's nodes to layout-snapshot entries, returning
+    ``(node, entry name)`` pairs.
+
+    Structure decides, names only break ties: a rebuild reuses authored
+    names for *different* nodes whenever duplicate-type creation order
+    differs, so a name match is a hint, never ground truth. A node is
+    compatible with an entry of its type when its evidence — links to
+    already-matched neighbours (Group Input/Output instances counting as
+    anonymous peers), plus frame parent/child relations — equals the
+    entry's. Each round binds every node compatible with exactly one entry
+    that no other node uniquely demands; when a round stalls, the first
+    same-name pair whose node evidence is a sub-multiset of its entry's (a
+    rebuild recreates the authored links but may drop one it refuses)
+    binds, and propagation resumes. Leftovers pair up by sorted name within
+    each type — after the fixpoint they are structural twins
+    (interchangeable by definition) or pairs the evidence could not
+    separate, where a best-effort spot beats no position at all."""
+    nodes = {node.name: node for node in tree.nodes}
+    node_parent = {
+        name: node.parent.name if node.parent is not None else None
+        for name, node in nodes.items()
+    }
+    entry_parent = {name: entry[2] for name, entry in entries.items()}
+
+    node_adj: dict[str, list[tuple[str, bool, str, str]]] = {name: [] for name in nodes}
+    for link in tree.links:
+        assert link.to_node and link.to_socket and link.from_node
+        assert link.from_socket is not None
+        to_key, from_key = socket_key(link.to_socket), socket_key(link.from_socket)
+        node_adj[link.to_node.name].append(
+            (to_key, False, link.from_node.name, from_key)
+        )
+        node_adj[link.from_node.name].append(
+            (from_key, True, link.to_node.name, to_key)
+        )
+    entry_adj: dict[str, list[tuple[str, bool, str, str]]] = {
+        name: [] for name in entries
+    }
+    for name, (_type, _pos, _parent, incoming) in entries.items():
+        for own_sock, peer, peer_sock in incoming:
+            entry_adj[name].append((own_sock, False, peer, peer_sock))
+            if peer in entry_adj:
+                entry_adj[peer].append((peer_sock, True, name, own_sock))
+
+    n2e: dict[str, str] = {}  # rebuilt node name -> entry (authored) name
+    e2n: dict[str, str] = {}
+
+    # Group Input/Output instances are matched by name alone and count as
+    # anonymous link peers: authored links may be spread over several split
+    # instances while the rebuilt tree still has them all on the primary
+    # (splits apply *after* the snapshot, once consumers carry their
+    # authored names), so instance identity would contradict, not confirm.
+    def node_sig(name: str) -> Counter[_Evidence]:
+        sig: Counter[_Evidence] = Counter()
+        if nodes[name].bl_idname not in _IO_BL_IDNAMES:
+            for own_sock, is_out, peer, peer_sock in node_adj[name]:
+                peer_type = nodes[peer].bl_idname
+                if peer_type in _IO_BL_IDNAMES:
+                    sig[(own_sock, is_out, peer_type, peer_sock)] += 1
+                elif peer in n2e:
+                    sig[(own_sock, is_out, n2e[peer], peer_sock)] += 1
+        parent = node_parent[name]
+        if parent is not None and parent in n2e:
+            sig[("parent", n2e[parent])] += 1
+        for child, child_parent in node_parent.items():
+            if child_parent == name and child in n2e:
+                sig[("child", n2e[child])] += 1
+        return sig
+
+    def entry_sig(name: str) -> Counter[_Evidence]:
+        sig: Counter[_Evidence] = Counter()
+        if entries[name][0] not in _IO_BL_IDNAMES:
+            for own_sock, is_out, peer, peer_sock in entry_adj[name]:
+                # A peer with no entry is a split Group Input instance — the
+                # snapshot deliberately omits them (they don't exist until
+                # the splits block runs, after this match).
+                peer_type = entries[peer][0] if peer in entries else "NodeGroupInput"
+                if peer_type in _IO_BL_IDNAMES:
+                    sig[(own_sock, is_out, peer_type, peer_sock)] += 1
+                elif peer in e2n:
+                    sig[(own_sock, is_out, peer, peer_sock)] += 1
+        parent = entry_parent[name]
+        if parent is not None and parent in e2n:
+            sig[("parent", parent)] += 1
+        for child, child_parent in entry_parent.items():
+            if child_parent == name and child in e2n:
+                sig[("child", child)] += 1
+        return sig
+
+    def bind(name: str, entry_name: str) -> None:
+        n2e[name] = entry_name
+        e2n[entry_name] = name
+
+    while True:
+        by_type_entries: dict[str, list[str]] = {}
+        for entry_name in entries:
+            if entry_name not in e2n:
+                by_type_entries.setdefault(entries[entry_name][0], []).append(
+                    entry_name
+                )
+        by_type_nodes: dict[str, list[str]] = {}
+        for name, node in nodes.items():
+            if name not in n2e and node.bl_idname in by_type_entries:
+                by_type_nodes.setdefault(node.bl_idname, []).append(name)
+
+        binds: list[tuple[str, str]] = []
+        for bl_idname, group_nodes in by_type_nodes.items():
+            node_sigs = {name: node_sig(name) for name in group_nodes}
+            entry_sigs = {name: entry_sig(name) for name in by_type_entries[bl_idname]}
+            # Both sides restrict evidence to already-matched neighbours, so
+            # a true pair's signatures are *equal* whenever the rebuild
+            # recreated every authored link (it does, short of a link the
+            # builder refused — those resolve via the name tie-break below).
+            # A node equal to exactly one entry must be that entry — unless
+            # another node demands the same entry just as uniquely, which
+            # means the evidence cannot separate them yet.
+            demands: dict[str, list[str]] = {}
+            for name, sig in node_sigs.items():
+                compatible = [
+                    entry_name for entry_name, esig in entry_sigs.items() if sig == esig
+                ]
+                if len(compatible) == 1:
+                    demands.setdefault(compatible[0], []).append(name)
+            for entry_name, claimants in demands.items():
+                if len(claimants) == 1:
+                    binds.append((claimants[0], entry_name))
+        if binds:
+            for name, entry_name in binds:
+                bind(name, entry_name)
+            continue
+
+        # Stalled: use a name match as a tie-break — one pair per stall, so
+        # the evidence it adds can veto later same-name pairs that would
+        # have bound wrongly.
+        tie = next(
+            (
+                name
+                for name in sorted(nodes)
+                if name not in n2e
+                and name in entries
+                and name not in e2n
+                and nodes[name].bl_idname == entries[name][0]
+                and _sub_multiset(node_sig(name), entry_sig(name))
+            ),
+            None,
+        )
+        if tie is None:
+            break
+        bind(tie, tie)
+
+    # Leftovers: pair remaining same-type nodes and entries by sorted name.
+    # After the fixpoint these are either structural twins (any assignment
+    # reproduces the authored look) or pairs blocked by a missing link — for
+    # which a best-effort spot still beats no position at all.
+    remaining_entries: dict[str, list[str]] = {}
+    for entry_name in sorted(entries):
+        if entry_name not in e2n:
+            remaining_entries.setdefault(entries[entry_name][0], []).append(entry_name)
+    for name in sorted(nodes):
+        if name in n2e:
+            continue
+        pool = remaining_entries.get(nodes[name].bl_idname)
+        if pool:
+            n2e[name] = pool.pop(0)
+
+    return [(nodes[name], entry_name) for name, entry_name in n2e.items()]
+
+
+class TreeBuilder[TreeT: NodeTree]:
+    """Builder for creating Blender node trees with a clean Python API.
+
+    Supports geometry, shader, and compositor node trees.
+    """
+
+    tree: TreeT
+    _tree_contexts: ClassVar[list[TreeBuilder]] = []
+    _frame_contexts: ClassVar[list[NodeFrame]] = []
+
+    def __init__(
+        self,
+        tree: NodeTree | str = "Geometry Nodes",
+        *,
+        tree_type: Literal[
+            "GeometryNodeTree", "ShaderNodeTree", "CompositorNodeTree"
+        ] = "GeometryNodeTree",
+        collapse: bool = False,
+        arrange: ArrangeMethod = "sugiyama",
+        fake_user: bool = False,
+        ignore_visibility: bool = False,
+        split_inputs: bool | None = None,
+        clear: bool = False,
+        keep_edits: bool | None = None,
+        is_modifier: bool | None = None,
+        is_tool: bool | None = None,
+    ):
+        # ``is_modifier``/``is_tool`` flag a geometry node group for use as a
+        # modifier or as a node tool; None leaves the tree's flags as they are.
+        # ``clear`` rebuilds in place: the tree is emptied (nodes, links and
+        # interface) before the body runs, keeping the datablock so modifiers,
+        # group nodes and pinned editors that reference it stay attached. With
+        # a name, an existing group of that name and tree type is reused
+        # instead of creating a ``Name.001`` duplicate; a group of another
+        # tree type is left alone and a new one is created as usual.
+        # Tree-level properties (description, color_tag, is_tool, fake user,
+        # ...) are kept: only the contents are rebuilt. Rebuilding the
+        # interface gives its sockets new identifiers, which is what
+        # Geometry Nodes modifiers key their input values by, so those values
+        # are snapshotted by socket name here and reapplied on exit.
+        # ``keep_edits`` (default: see default_keep_edits) carries the layout
+        # edits made to the tree since it was last arranged (moved, resized,
+        # collapsed, framed or relabelled nodes) over to the rebuild, onto
+        # the nodes that match; see nodebpy.layout.keep.
+        if isinstance(tree, str):
+            existing = bpy.data.node_groups.get(tree) if clear else None
+            if existing is not None and existing.bl_idname == tree_type:
+                self.tree = existing
+            else:
+                self.tree = bpy.data.node_groups.new(tree, tree_type)  # ty: ignore[invalid-assignment]
+        else:
+            self.tree = tree  # type: ignore
+        self._preserved_inputs: AbstractContextManager[None] | None = None
+        self._kept_edits: _keep.Edits | None = None
+        if keep_edits is None:
+            keep_edits = _DEFAULT_KEEP_EDITS.get()
+        if clear and keep_edits and arrange is not None:
+            self._kept_edits = _keep.record(self.tree)
+        self._animation: NodeAnimation | None = None
+        self._group_links: GroupLinks | None = None
+        self._edited: NodeTree | None = None
+        self._unedited_users: list[NodeTree] = []
+        self._record = clear or _RECORD_BUILDS.get()
+        if clear:
+            from ..live import (
+                GroupLinks,
+                NodeAnimation,
+                preserve_modifier_inputs,
+                unedited_users,
+                was_edited,
+            )
+
+            self._unedited_users = unedited_users(self.tree)
+            if was_edited(self.tree):
+                # Kept as "<name> (edited)" on exit, unless the rebuild
+                # computes the same (the code was written out from it).
+                self._edited = self.tree.copy()
+            assert self.tree.interface is not None
+            self._preserved_inputs = preserve_modifier_inputs([self.tree])
+            self._preserved_inputs.__enter__()
+            # Removing the nodes would delete their keyframes and drivers.
+            self._animation = NodeAnimation(self.tree)
+            # A new interface drops what group nodes using the tree link to.
+            self._group_links = GroupLinks(self.tree)
+            self.tree.nodes.clear()
+            self.tree.interface.clear()
+
+        if is_modifier is not None:
+            self.is_modifier = is_modifier
+        if is_tool is not None:
+            self.is_tool = is_tool
+
+        self._menu_defaults: list[_MenuDefault] = []
+        self._exited = False
+        self.inputs: InputInterfaceContext = InputInterfaceContext(self)
+        self.outputs: OutputInterfaceContext = OutputInterfaceContext(self)
+        self._arrange = arrange
+        self.collapse = collapse
+        self.fake_user = fake_user
+        self.ignore_visibility = ignore_visibility
+        self._split_inputs = split_inputs
+
+    @classmethod
+    def geometry(
+        cls,
+        name: GeometryNodeTree | str = "Geometry Nodes",
+        *,
+        collapse: bool = False,
+        arrange: ArrangeMethod = "sugiyama",
+        fake_user: bool = False,
+        split_inputs: bool | None = None,
+        clear: bool = False,
+        keep_edits: bool | None = None,
+        is_modifier: bool | None = None,
+        is_tool: bool | None = None,
+    ) -> TreeBuilder[GeometryNodeTree]:
+        """Create a geometry node tree.
+
+        ``is_modifier`` and ``is_tool`` flag the group for use as a modifier
+        or as a node tool; ``None`` leaves an existing group's flags alone.
+        """
+        return cast(
+            "TreeBuilder[GeometryNodeTree]",
+            cls(
+                name,
+                tree_type="GeometryNodeTree",
+                collapse=collapse,
+                arrange=arrange,
+                fake_user=fake_user,
+                split_inputs=split_inputs,
+                clear=clear,
+                keep_edits=keep_edits,
+                is_modifier=is_modifier,
+                is_tool=is_tool,
+            ),
+        )
+
+    @classmethod
+    def shader(
+        cls,
+        name: ShaderNodeTree | str = "Shader Nodes",
+        *,
+        collapse: bool = False,
+        arrange: ArrangeMethod = "sugiyama",
+        fake_user: bool = False,
+        split_inputs: bool | None = None,
+        clear: bool = False,
+        keep_edits: bool | None = None,
+    ) -> TreeBuilder[ShaderNodeTree]:
+        """Create a shader node tree."""
+        return cast(
+            "TreeBuilder[ShaderNodeTree]",
+            cls(
+                name,
+                tree_type="ShaderNodeTree",
+                collapse=collapse,
+                arrange=arrange,
+                fake_user=fake_user,
+                split_inputs=split_inputs,
+                clear=clear,
+                keep_edits=keep_edits,
+            ),
+        )
+
+    @classmethod
+    def compositor(
+        cls,
+        name: CompositorNodeTree | str = "Compositor Nodes",
+        *,
+        collapse: bool = False,
+        arrange: ArrangeMethod = "sugiyama",
+        fake_user: bool = False,
+        split_inputs: bool | None = None,
+        clear: bool = False,
+        keep_edits: bool | None = None,
+        scene: bool = False,
+    ) -> TreeBuilder[CompositorNodeTree]:
+        """Create a compositor node tree; ``scene=True`` also makes it the
+        active scene's compositor."""
+        builder = cast(
+            "TreeBuilder[CompositorNodeTree]",
+            cls(
+                name,
+                tree_type="CompositorNodeTree",
+                collapse=collapse,
+                arrange=arrange,
+                fake_user=fake_user,
+                split_inputs=split_inputs,
+                clear=clear,
+                keep_edits=keep_edits,
+            ),
+        )
+        if scene:
+            active = bpy.context.scene
+            assert active is not None, "no active scene to set the compositor on"
+            active.compositing_node_group = builder.tree
+        return builder
+
+    @property
+    def nodes(self) -> Nodes:
+        return self.tree.nodes
+
+    @property
+    def fake_user(self) -> bool:
+        return self.tree.use_fake_user
+
+    @fake_user.setter
+    def fake_user(self, value: bool) -> None:
+        self.tree.use_fake_user = value
+
+    @property
+    def is_modifier(self) -> bool:
+        """Whether the group can be used as a Geometry Nodes modifier."""
+        return getattr(self.tree, "is_modifier", False)
+
+    @is_modifier.setter
+    def is_modifier(self, value: bool) -> None:
+        self.tree.is_modifier = value  # ty: ignore[unresolved-attribute]
+
+    @property
+    def is_tool(self) -> bool:
+        """Whether the group can be used as a node tool."""
+        return getattr(self.tree, "is_tool", False)
+
+    @is_tool.setter
+    def is_tool(self, value: bool) -> None:
+        self.tree.is_tool = value  # ty: ignore[unresolved-attribute]
+
+    def to_python(
+        self,
+        min_chain_length: int = 3,
+        strict: bool = True,
+        max_inline_width: int | None = 88,
+        snapshot_positions: bool = False,
+        keep_reroutes: bool = False,
+        top_level: Literal["with", "class"] = "with",
+        format: bool = True,
+        nodebpy_pkg: str = "nodebpy",
+        in_place: bool = False,
+        groups: Literal["inline", "reference"] = "inline",
+        group_modules: Collection[str] | None = None,
+    ) -> str:
+        """Generate Python source that recreates this tree using nodebpy.
+
+        See :func:`nodebpy.codegen.to_python` for parameter details.
+        """
+        from ..export import to_python
+
+        return to_python(
+            self,
+            min_chain_length=min_chain_length,
+            strict=strict,
+            max_inline_width=max_inline_width,
+            snapshot_positions=snapshot_positions,
+            keep_reroutes=keep_reroutes,
+            top_level=top_level,
+            format=format,
+            nodebpy_pkg=nodebpy_pkg,
+            in_place=in_place,
+            groups=groups,
+            group_modules=group_modules,
+        )
+
+    def to_mermaid(self, fenced: bool = True) -> str:
+        """Generate a Mermaid diagram that represents this tree.
+
+        This can be used for documentation or visualization purposes.
+        The Mermaid syntax is supported by many tools, including GitHub and Jupyter notebooks.
+
+        Arguments
+        ---------
+            fenced:
+                Whether to wrap the output in a fenced code block with mermaid syntax highlighting.
+
+        Returns
+        -------
+            A string containing the Mermaid diagram syntax representing this node tree.
+        """
+        from ..export import to_mermaid
+
+        return to_mermaid(self, fenced=fenced)
+
+    def to_plot(
+        self,
+        filepath: str | Path,
+        *,
+        title: str | None = None,
+        dpi: int = 150,
+        node: bool = False,
+        open_panels: bool = False,
+        width: float | None = None,
+        axes: bool = False,
+    ) -> Path:
+        """Draw this tree to an image, styled like Blender's node editor,
+        for headless review (``pip install nodebpy[plot]``): its internals,
+        or with ``node=True`` the single group node a user adds to another
+        tree, showing the interface sockets with their default values.
+
+        See :func:`nodebpy.export.to_plot`.
+        """
+        from ..export import to_plot
+
+        return to_plot(
+            self.tree,
+            filepath,
+            title=title,
+            dpi=dpi,
+            node=node,
+            open_panels=open_panels,
+            width=width,
+            axes=axes,
+        )
+
+    def activate_tree(self) -> None:
+        """Make this tree the active tree for all new node creation."""
+        TreeBuilder._tree_contexts.append(self)
+
+    def deactivate_tree(self) -> None:
+        """Whatever tree was previously active is set to be the active one (or None if no previously active tree)."""
+        TreeBuilder._tree_contexts.pop()
+
+    def __enter__(self) -> Self:
+        self.activate_tree()
+        self._exited = False
+        return self
+
+    def __exit__(self, *args: object) -> None:
+        # Split before auto-layout, so the created instances get arranged
+        # next to their consumers.
+        split = self._split_inputs
+        if split is None:
+            # The ambient default (see default_split_inputs) only reaches
+            # auto-arranged trees: snapshot-positions dumps disable
+            # arrangement and their authored layout — including any authored
+            # Group Input splits — must survive untouched.
+            split = self._arrange is not None and _DEFAULT_SPLIT_INPUTS.get()
+        if split:
+            self.split_group_inputs()
+        if self._arrange is not None:
+            self.arrange()
+            if self._kept_edits is not None:
+                _keep.restore(self._kept_edits, self.tree)
+        self._kept_edits = None
+        if self._animation is not None:
+            self._animation.restore()
+            self._animation = None
+        if self._group_links is not None:
+            self._group_links.restore()
+            self._group_links = None
+        self._apply_input_defaults()
+        if self._preserved_inputs is not None:
+            self._preserved_inputs.__exit__(None, None, None)
+            self._preserved_inputs = None
+        self._warn_invalid_links()
+        if self._edited is not None:
+            copies = _EDITED_COPIES.get()
+            if copies is not None:
+                copies.append((self.tree, self._edited))
+            else:
+                from ..live import settle_edited
+
+                settle_edited(self.tree, self._edited)
+            self._edited = None
+        if self._record:
+            from ..live import stamp_build
+
+            stamp_build(self.tree)
+            for user in self._unedited_users:
+                stamp_build(user)
+            self._unedited_users = []
+        # Interface-menu defaults assigned from here on can't wait for a
+        # context exit that already happened — apply them immediately
+        # (see MenuSocket.default_value).
+        self._exited = True
+        self.deactivate_tree()
+
+    def invalid_links(self) -> list[bpy.types.NodeLink]:
+        """Links Blender can't evaluate, drawn red in the node editor: most
+        often a field reaching an input that takes a single value, such as a
+        Repeat Zone's Iterations or Points' Count. Muted links and links to
+        sockets the node's settings hide or grey out aren't evaluated, so they
+        aren't reported."""
+
+        def evaluated(socket: NodeSocket | None) -> bool:
+            return (
+                socket is not None
+                and not socket.is_unavailable
+                and not socket.is_inactive
+            )
+
+        return [
+            link
+            for link in self.tree.links
+            if not link.is_valid
+            and not link.is_muted
+            and not link.is_hidden
+            and evaluated(link.from_socket)
+            and evaluated(link.to_socket)
+        ]
+
+    def _warn_invalid_links(self) -> None:
+        invalid = self.invalid_links()
+        if not invalid:
+            return
+        lines = []
+        for link in invalid:
+            source, target = link.from_socket, link.to_socket
+            assert source is not None and target is not None
+            assert link.from_node is not None and link.to_node is not None
+            line = (
+                f"  {link.from_node.name}.{source.name} -> "
+                f"{link.to_node.name}.{target.name}"
+            )
+            # Blender draws inputs that only take a single value as a line.
+            if (
+                target.display_shape == "LINE"
+                and source.inferred_structure_type == "FIELD"
+            ):
+                line += f" ('{target.name}' takes a single value, not a field)"
+            lines.append(line)
+        count = "1 link" if len(invalid) == 1 else f"{len(invalid)} links"
+        warnings.warn(
+            f"Blender can't evaluate {count} in '{self.tree.name}':\n"
+            + "\n".join(lines),
+            InvalidLinkWarning,
+            stacklevel=3,
+        )
+
+    def _apply_input_defaults(self) -> None:
+        if not self._menu_defaults:
+            return
+        # Menu enums populate by propagation from the Menu Switch that
+        # defines them; a headless session never runs the editor update that
+        # triggers it, so without this nudge the assignments below silently
+        # store an empty default. The update can reallocate the targets, so
+        # each is re-resolved from its breadcrumbs before assignment.
+        self.tree.interface_update(bpy.context)
+        for value in self._menu_defaults:
+            if value.default == "":
+                continue
+            item = value.resolve(self.tree)
+            if item is not None:
+                try:
+                    item.default_value = value.default
+                except TypeError as error:
+                    node = getattr(item, "node", None)
+                    where = f"{node.name}'s " if node is not None else "The "
+                    raise enum_value_error(
+                        error, f"{where}'{item.name}' menu"
+                    ) from None
+
+    def __len__(self) -> int:
+        return len(self.nodes)
+
+    def disable_arrange(self) -> None:
+        """Disable the auto-layout that otherwise runs when this tree's context
+        exits, so explicitly assigned node locations are preserved."""
+        self._arrange = None
+
+    def panel(
+        self,
+        name: str | bpy.types.NodeTreeInterfacePanel | TreePanelContext,
+        *,
+        description: str = "",
+        default_closed: bool = False,
+        reuse: bool = True,
+    ) -> TreePanelContext:
+        """A panel that can group input *and* output sockets together
+        (``tree.inputs.panel`` / ``tree.outputs.panel`` group one direction).
+        Reuses an existing same-named panel under the same parent, so a mixed
+        panel can be declared in separate input and output passes; pass
+        ``reuse=False`` to always create a fresh panel — Blender allows
+        several same-named sibling panels, and rebuilding such an interface
+        must not fold them into one. Passing an existing panel (or a previous
+        ``tree.panel(...)`` context) instead of a name reopens exactly that
+        panel — the unambiguous spelling generated code uses for the second
+        direction pass over a same-named sibling."""
+        if isinstance(name, TreePanelContext):
+            assert name.panel is not None
+            name = name.panel
+        return TreePanelContext(
+            self,
+            name,
+            description=description,
+            default_closed=default_closed,
+            reuse=reuse,
+        )
+
+    @property
+    def node_positions(self) -> dict[str, tuple[float, float]]:
+        """A ``{node name: (x, y)}`` snapshot of every node's location."""
+        return {
+            node.name: (node.location.x, node.location.y) for node in self.tree.nodes
+        }
+
+    @node_positions.setter
+    def node_positions(self, positions: dict[str, tuple[float, float]]) -> None:
+        """Apply ``{node name: (x, y)}`` locations. Names absent from the tree
+        (e.g. a reroute a rebuild dropped) are skipped."""
+        for name, location in positions.items():
+            node = self.tree.nodes.get(name)
+            if node is not None:
+                node.location = location
+
+    @property
+    def layout_snapshot(self) -> dict[str, _LayoutEntry]:
+        """A structural layout snapshot: for every node its type, ``(x, y)``
+        location, frame parent and incoming links, keyed by node name —
+        the block ``to_python(snapshot_positions=True)`` emits. See the
+        setter for how it is applied."""
+        incoming: dict[str, list[tuple[str, str, str]]] = {}
+        for link in self.tree.links:
+            assert link.to_node and link.to_socket and link.from_node
+            assert link.from_socket is not None
+            incoming.setdefault(link.to_node.name, []).append(
+                (
+                    socket_key(link.to_socket),
+                    link.from_node.name,
+                    socket_key(link.from_socket),
+                )
+            )
+        return {
+            node.name: (
+                node.bl_idname,
+                (node.location.x, node.location.y),
+                node.parent.name if node.parent is not None else None,
+                tuple(sorted(incoming.get(node.name, ()))),
+            )
+            for node in self.tree.nodes
+        }
+
+    @layout_snapshot.setter
+    def layout_snapshot(self, snapshot: dict[str, _LayoutEntry]) -> None:
+        """Restore authored node names and locations from a snapshot.
+
+        A rebuild names duplicate-type nodes by creation order (``Math``,
+        ``Math.001``, ...), which rarely matches the authored order, so
+        applying locations by bare name would put nodes on each other's
+        authored spots. Nodes are instead matched to snapshot entries
+        structurally: exact name+type matches seed the correspondence, then
+        it grows through link/frame evidence against already-matched
+        neighbours; matched nodes are renamed to their authored names and
+        moved to their authored locations. Entries a rebuild has no
+        counterpart for (e.g. dropped reroutes) are skipped, so applying a
+        snapshot to an edited tree degrades gracefully."""
+        entries = {
+            name: (entry[0], tuple(entry[1]), entry[2], tuple(entry[3]))
+            for name, entry in snapshot.items()
+        }
+        matches = _match_layout_snapshot(self.tree, entries)
+
+        # Rename via unique temporaries: authored names can swap between
+        # nodes (assigning directly would make Blender suffix the second),
+        # and an unmatched node squatting on a target name must yield it.
+        targets = {entry_name for _node, entry_name in matches}
+        matched_nodes = {node.name for node, _entry_name in matches}
+        squatters = [
+            node
+            for node in self.tree.nodes
+            if node.name in targets and node.name not in matched_nodes
+        ]
+        displaced = [(node, node.name) for node in squatters]
+        for index, node in enumerate([node for node, _ in matches] + squatters):
+            node.name = f"__nodebpy_tmp_{index}"
+        matched_by_entry = {entry_name: node for node, entry_name in matches}
+        for node, entry_name in matches:
+            node.name = entry_name
+            _bl_idname, location, parent, _links = entries[entry_name]
+            # Restore frame membership before the location: locations are
+            # parent-relative, and a rebuild leaves some nodes unparented
+            # (split Group Input instances are created outside any frame).
+            parent_node = matched_by_entry.get(parent) if parent is not None else None
+            if parent_node is not None or parent is None:
+                node.parent = cast("NodeFrame | None", parent_node)
+            node.location = location
+        for node, old_name in displaced:
+            node.name = old_name  # re-suffixed by Blender on collision
+
+    @property
+    def group_input_splits(self) -> list[dict[str, Any]]:
+        """The extra Group Input instances beyond the primary one, each as
+        ``{"name": ..., "label": ..., "links": [(interface input name,
+        consumer node name, consumer socket key), ...], "location": ...,
+        "parent": ...}`` — the editor convention of several input nodes near
+        their consumers instead of one node trailing long noodles. See the
+        setter."""
+        splits: list[dict[str, Any]] = []
+        for node in self.tree.nodes:
+            if node.bl_idname != "NodeGroupInput" or node.name == "Group Input":
+                continue
+            links: list[tuple[str, str, str]] = []
+            for socket in node.outputs:
+                for link in socket.links or ():
+                    to_node, to_socket = link.to_node, link.to_socket
+                    assert to_node is not None and to_socket is not None
+                    links.append((socket.name, to_node.name, socket_key(to_socket)))
+            splits.append(
+                {
+                    "name": node.name,
+                    "label": node.label,
+                    "links": links,
+                    "location": (node.location.x, node.location.y),
+                    "parent": node.parent.name if node.parent is not None else None,
+                }
+            )
+        return splits
+
+    @group_input_splits.setter
+    def group_input_splits(self, splits: list[dict[str, Any]]) -> None:
+        """Split the Group Input node into several instances: each entry
+        creates one instance carrying the listed links (moved off whichever
+        input node holds them — exactly one per entry, so parallel links from
+        several instances into one multi-input socket are never swept away
+        together). An entry naming a consumer or socket the tree doesn't have
+        is skipped — that noodle simply stays on the primary node — so
+        applying a snapshot to an edited tree degrades gracefully, like
+        :attr:`node_positions`."""
+        # Deferred menu defaults must land before any link moves: their enums
+        # propagate through the pre-split wiring, and re-sourcing a menu link
+        # leaves the enum unpopulated until an editor update this headless
+        # session never runs.
+        self._apply_input_defaults()
+        self._menu_defaults.clear()
+        for split in splits:
+            instance = self.tree.nodes.new("NodeGroupInput")
+            assert instance is not None
+            instance.name = split["name"]
+            if label := split.get("label"):
+                instance.label = label
+            # Authored placement (parent before location — locations are
+            # parent-relative); older snapshots without these keys leave the
+            # instance where auto-layout or the caller puts it.
+            parent = self.tree.nodes.get(split.get("parent") or "")
+            if isinstance(parent, NodeFrame):
+                instance.parent = parent
+            if (location := split.get("location")) is not None:
+                instance.location = location
+            for from_name, to_node_name, to_socket_key in split["links"]:
+                to_node = self.tree.nodes.get(to_node_name)
+                if to_node is None:
+                    continue
+                to_socket = resolve_socket_key(to_node.inputs, to_socket_key)
+                if to_socket is None:
+                    continue
+                # Only re-source an existing identical link: the consumer
+                # must already take this same interface input from some
+                # Group Input instance. A rebuild that assigned this name to
+                # a *different* node fails the check and the noodle stays on
+                # the primary — names alone must never create connectivity,
+                # or two same-typed consumers could end up cross-wired.
+                existing = [
+                    link
+                    for link in to_socket.links or ()
+                    if link.from_node is not None
+                    and link.from_socket is not None
+                    and link.from_node.bl_idname == "NodeGroupInput"
+                    and link.from_socket.name == from_name
+                ]
+                if not existing:
+                    continue
+                # Move exactly one link per recorded entry: a multi-input
+                # socket legally takes the same interface input several
+                # times, and the getter records one entry per link — moving
+                # them all here would collapse the duplicates into one.
+                # Prefer a link still on another instance so repeated entries
+                # walk through the remaining duplicates.
+                link = next(
+                    (ln for ln in existing if ln.from_node != instance), existing[0]
+                )
+                # Re-source the very interface socket the link already uses
+                # (by identifier): interface names can repeat across types,
+                # so a name lookup on the instance could pick a same-named
+                # socket of the wrong type and forge an invalid link.
+                assert link.from_socket is not None
+                identifier = link.from_socket.identifier
+                from_socket = next(
+                    (s for s in instance.outputs if s.identifier == identifier), None
+                )
+                if from_socket is None:
+                    continue  # pragma: no cover - instance lacks the socket
+                self.tree.links.remove(link)
+                # Removing the link can retype a reroute consumer, freeing
+                # and recreating its sockets — re-resolve before relinking.
+                to_socket = resolve_socket_key(to_node.inputs, to_socket_key)
+                if to_socket is None:
+                    continue  # pragma: no cover - socket vanished on retype
+                self.tree.links.new(from_socket, to_socket)
+        if splits:
+            self._hide_unused_input_sockets()
+
+    def split_group_inputs(self) -> None:
+        """Split the Group Input node into one instance per consumer node,
+        with unused sockets hidden — regenerating the editor style that
+        avoids a single input node trailing long noodles. Each instance is
+        named (and labelled, so the editor header shows it) after the
+        interface sockets it carries, making it easy to spot when scanning
+        the tree (Blender de-duplicates repeated names with ``.001``
+        suffixes as usual), and parented into its consumer's frame so the
+        arranger's frame clustering keeps the pair together. Runs automatically on context exit (before auto-layout, so
+        the instances are arranged next to their consumers) when the builder
+        was created with ``split_inputs=True``, or inside a
+        :func:`~nodebpy.builder.default_split_inputs` scope."""
+        primary = self.tree.nodes.get("Group Input")
+        if primary is None:
+            return
+        by_consumer: dict[str, list[tuple[str, str, str]]] = {}
+        for socket in primary.outputs:
+            for link in socket.links:
+                by_consumer.setdefault(link.to_node.name, []).append(
+                    (socket.name, link.to_node.name, socket_key(link.to_socket))
+                )
+
+        def socket_names(links: list[tuple[str, str, str]]) -> str:
+            return ", ".join(dict.fromkeys(name for name, _, _ in links))
+
+        def parent_frame(consumer: str) -> str | None:
+            parent = self.tree.nodes[consumer].parent
+            return parent.name if parent is not None else None
+
+        # The first consumer keeps the primary node; each further consumer
+        # gets its own instance, named after the sockets it carries and
+        # parented into the consumer's frame — frame clustering would
+        # otherwise push an unparented instance away from its consumer when
+        # the tree is arranged.
+        self.group_input_splits = [
+            {
+                "name": socket_names(by_consumer[consumer]),
+                "label": socket_names(by_consumer[consumer]),
+                "parent": parent_frame(consumer),
+                "links": by_consumer[consumer],
+            }
+            for consumer in list(by_consumer)[1:]
+        ]
+        self._hide_unused_input_sockets()
+
+    def _hide_unused_input_sockets(self) -> None:
+        """Hide every unlinked output on every Group Input instance (the
+        virtual extension socket excluded), as the editor's Hide Unused
+        Sockets does."""
+        for node in self.tree.nodes:
+            if node.bl_idname != "NodeGroupInput":
+                continue
+            for socket in node.outputs:
+                if not socket.identifier.startswith("__extend__"):
+                    socket.hide = not socket.is_linked
+
+    def arrange(self) -> None:
+        _arrange_nodes(self.tree, self._arrange)
+
+    def _repr_markdown_(self) -> str | None:
+        """
+        Return Markdown representation for Jupyter notebook display.
+
+        This special method is called by Jupyter to display the TreeBuilder as a Mermaid diagram
+        when it's the return value of a cell.
+        """
+        try:
+            from ..export import to_mermaid
+
+            return to_mermaid(self)
+        except Exception as e:  # noqa: BLE001
+            print(f"Mermaid diagram generation failed: {e}")
+            return None
+
+    def _repr_html_(self) -> str | None:
+        """
+        Return an interactive geonodes-web-render graph for Jupyter/Quarto.
+
+        This is called when the TreeBuilder is the return value of a cell. The
+        tree is exported to the Tree Clipper format and embedded as a Blender-
+        styled, pan/zoomable graph. Returning ``None`` on failure lets the
+        Mermaid ``_repr_markdown_`` fallback take over.
+        """
+        try:
+            from ..export import to_web_render_html
+
+            return to_web_render_html(self)
+        except Exception as e:  # noqa: BLE001
+            print(f"Web render generation failed: {e}")
+            return None
+
+    def _input_node(self) -> Node:
+        """Get or create the Group Input node."""
+        try:
+            return self.tree.nodes["Group Input"]
+        except KeyError:
+            node = self.tree.nodes.new("NodeGroupInput")
+            assert node is not None
+            return node
+
+    def _output_node(self) -> Node:
+        """Get or create the Group Output node."""
+        try:
+            return self.tree.nodes["Group Output"]
+        except KeyError:
+            node = self.tree.nodes.new("NodeGroupOutput")
+            assert node is not None
+            return node
+
+    def link(self, socket1: NodeSocket, socket2: NodeSocket) -> bpy.types.NodeLink:
+        # Unwrap Socket wrappers to raw NodeSocket
+        if not isinstance(socket1, NodeSocket):
+            socket1 = socket1.socket  # type: ignore[attr-defined]
+        if not isinstance(socket2, NodeSocket):
+            socket2 = socket2.socket  # type: ignore[attr-defined]
+
+        is_reroute = (
+            getattr(socket1.node, "bl_idname", None) == "NodeReroute"
+            or getattr(socket2.node, "bl_idname", None) == "NodeReroute"
+        )
+        if (
+            not is_reroute
+            and socket1.type not in SOCKET_COMPATIBILITY.get(socket2.type, ())
+            and socket1.type != "CUSTOM"
+            and socket2.type != "CUSTOM"
+        ):
+            raise SocketError(
+                f"Incompatible socket types, {socket1.type} and {socket2.type}"
+            )
+
+        if not self.ignore_visibility:
+            # a socket the node's settings hide (Vector Math's Vector output in
+            # Dot Product mode) takes the link but never passes anything along
+            for socket in (socket1, socket2):
+                if getattr(socket, "is_unavailable", False):
+                    raise RuntimeError(_unavailable_message(socket))
+
+        link = self.tree.links.new(socket1, socket2, handle_dynamic_sockets=True)
+        assert link is not None
+
+        # handle_dynamic_sockets=True can free and recreate an endpoint (a
+        # reroute retypes its sockets to match the link), leaving socket1 /
+        # socket2 dangling — read the endpoints back off the link instead.
+        from_socket, to_socket = link.from_socket, link.to_socket
+        assert from_socket is not None and to_socket is not None
+
+        if (
+            any(socket.is_inactive for socket in [from_socket, to_socket])
+            and not self.ignore_visibility
+        ):
+            for socket in [from_socket, to_socket]:
+                assert socket.node is not None
+                if socket.is_inactive and (
+                    # allow innactive sockets on some node types but we can't just blanket allow the sockets
+                    # for the Mix node as it has sockets for each data type so we have to check if they are
+                    # active and if they match the currently selected data type. If they are the same data type
+                    # then we allow it because they poll as innative when factor is 0.0 or 1.0.
+                    not _allow_innactive_sockets(socket.node)
+                    and (getattr(socket.node, "data_type", None) != socket.type)
+                ):
+                    other = to_socket if socket is from_socket else from_socket
+                    assert other.node is not None
+                    direction = "input" if socket.is_output is False else "output"
+                    message = (
+                        f"Socket '{socket.name}' ({direction}) on node "
+                        f"'{socket.node.name}' ({socket.node.bl_idname}) is inactive, "
+                        f"so the link from '{other.name}' on '{other.node.name}' will "
+                        "be created by Blender but ignored when evaluated. "
+                        f"Socket type: {socket.bl_idname}."
+                    )
+                    raise RuntimeError(message)
+
+        return link
+
+    def add(self, name: str) -> Node:
+        node = self.tree.nodes.new(name)
+        assert node is not None
+        node.hide = self.collapse
+        if self._frame_contexts:
+            node.parent = self._frame_contexts[-1]
+        return node
+
+
+class MaterialBuilder(TreeBuilder[ShaderNodeTree]):
+    def __init__(
+        self,
+        name: str = "New Material",
+        *,
+        collapse: bool = False,
+        arrange: ArrangeMethod = "sugiyama",
+        fake_user: bool = False,
+        ignore_visibility: bool = False,
+        clear: bool = False,
+        keep_edits: bool | None = None,
+    ):
+        # With ``clear`` an existing material of that name is rebuilt in place
+        # (objects keep it assigned) instead of creating ``Name.001``. A new
+        # material starts with Blender's default Principled BSDF and Material
+        # Output nodes, which are removed so the body builds from empty.
+        material = bpy.data.materials.get(name) if clear else None
+        reused = material is not None
+        if material is None:
+            material = bpy.data.materials.new(name)
+        assert material is not None
+        self.material = material
+        self.material.use_fake_user = fake_user
+        assert self.material.node_tree
+        super().__init__(
+            self.material.node_tree,
+            collapse=collapse,
+            arrange=arrange,
+            fake_user=fake_user,
+            ignore_visibility=ignore_visibility,
+            clear=True,
+            keep_edits=keep_edits if reused else False,
+        )
+
+
+class WorldBuilder(TreeBuilder[ShaderNodeTree]):
+    """Builds a world's node tree, as :class:`MaterialBuilder` does a
+    material's; ``world`` is the ``bpy.types.World``."""
+
+    def __init__(
+        self,
+        name: str = "World",
+        *,
+        collapse: bool = False,
+        arrange: ArrangeMethod = "sugiyama",
+        fake_user: bool = False,
+        ignore_visibility: bool = False,
+        clear: bool = False,
+        keep_edits: bool | None = None,
+        scene: bool = False,
+    ):
+        # With ``clear`` an existing world of that name is rebuilt in place (a
+        # scene using it keeps it). A new world's default Background and World
+        # Output nodes are removed so the body builds from empty.
+        world = bpy.data.worlds.get(name) if clear else None
+        reused = world is not None
+        if world is None:
+            world = bpy.data.worlds.new(name)
+        assert world is not None and world.node_tree is not None
+        self.world = world
+        self.world.use_fake_user = fake_user
+        super().__init__(
+            world.node_tree,
+            collapse=collapse,
+            arrange=arrange,
+            fake_user=fake_user,
+            ignore_visibility=ignore_visibility,
+            clear=True,
+            keep_edits=keep_edits if reused else False,
+        )
+        if scene:
+            active = bpy.context.scene
+            assert active is not None, "no active scene to set the world on"
+            active.world = world
+
+
+def _unavailable_message(socket: NodeSocket) -> str:
+    """Why ``socket`` can't be linked: what its node's settings make available."""
+    node = socket.node
+    assert node is not None
+    direction = "output" if socket.is_output else "input"
+    sockets = node.outputs if socket.is_output else node.inputs
+    available = [s.name for s in sockets or () if s.name and not s.is_unavailable]
+    base = set(bpy.types.Node.bl_rna.properties.keys())
+    settings = {
+        prop.identifier: getattr(node, prop.identifier)
+        for prop in node.bl_rna.properties
+        if prop.type == "ENUM" and not prop.is_readonly and prop.identifier not in base
+    }
+    return (
+        f"'{node.name}' has no '{socket.name}' {direction} with its current "
+        f"settings {settings}; available: {available}."
+    )

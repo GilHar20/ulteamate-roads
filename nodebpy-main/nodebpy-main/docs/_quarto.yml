@@ -1,0 +1,183 @@
+project:
+  type: website
+  output-dir: _build
+  pre-render:
+    - _config.py
+    - examples/render.py
+  # the .blend behind each example image, for its download button
+  resources:
+    - examples/images/*.blend
+
+website:
+  title: "nodebpy {{< var version >}}"
+  page-navigation: true
+  llms-txt: true
+
+  navbar:
+    left:
+      - href: index.qmd
+        text: Home
+      - text: Documentation
+        menu:
+          - introduction.qmd
+          - operators.qmd
+          - node-api.qmd
+          - custom-node-groups.qmd
+          - assets.qmd
+          - nodes-to-code.qmd
+          - using.qmd
+          - comparisons.qmd
+      - href: examples/index.qmd
+        text: Examples
+      - href: reference/
+        text: Reference
+      - href: changelog.qmd
+        text: Changelog
+    right:
+      - icon: github
+        href: https://github.com/BradyAJohnston/nodebpy
+
+  sidebar:
+    - id: docs
+      style: floating
+      contents:
+        - introduction.qmd
+        - operators.qmd
+        - node-api.qmd
+        - custom-node-groups.qmd
+        - assets.qmd
+        - nodes-to-code.qmd
+        - using.qmd
+        - comparisons.qmd
+
+# tell quarto to read the generated sidebar
+metadata-files:
+  - reference/_sidebar.yml
+
+format:
+  html:
+    toc: true
+    theme:
+      - darkly
+      - nodebpy.scss
+    include-in-header: shiki.html
+    # highlight-style:
+    #   dark: dracula.theme
+
+filters:
+  - interlinks
+
+interlinks:
+  sources:
+    python:
+      url: https://docs.python.org/3/
+    numpy:
+      url: https://numpy.org/doc/stable/
+
+quartodoc:
+  # the name used to import the package you want to create reference docs for
+  package: nodebpy
+  renderer:
+    style: _renderer.py
+
+  # write sidebar and style data
+  sidebar: reference/_sidebar.yml
+  css: reference/_styles-quartodoc.css
+
+  options:
+    include_attributes: true
+    include_functions: true
+    include_inherited: true
+    include_empty: true
+    signature_name: short
+
+  sections:
+    - title: Interface
+      contents:
+        - builder.tree
+        - builder.socket
+        - builder.node
+        - builder.accessor
+        - TreeBuilder
+        - builder.BaseNode
+    - title: Arrangement
+      desc: Automatic node layout and its options.
+      contents:
+        - arrange
+        - SugiyamaOptions
+        - SIMPLE_OPTIONS
+        - default_split_inputs
+        - default_sugiyama_options
+    - title: Assets
+      desc: Generating classes from pre-build assets
+      contents:
+        - assets.generate_asset_api
+        - assets.generate_asset_modules
+        - assets.dump_library
+        - assets.build_library
+        - assets.plot_library
+        - assets.AssetLibrary
+        - assets.BundledLibrary
+        - assets.PackageLibrary
+    - title: Export
+      desc: Exporting node trees to code.
+      contents:
+        - export.to_python
+        - export.to_mermaid
+        - export.to_plot
+        - export.serialize_library
+        - export.compare_libraries
+    - title: Live
+      desc: Re-running source safely in a live session.
+      contents:
+        - live.run_source
+        - live.RunResult
+        - live.preserve_modifier_inputs
+        - live.stash_groups
+        - live.GroupStash
+        - live.group_names_in_source
+
+    - title: Geometry Nodes
+      desc: Nodes use in Geometry Nodes trees.
+      contents:
+        - nodes.geometry.input
+        - nodes.geometry.attribute
+        - nodes.geometry.color
+        - nodes.geometry.converter
+        - nodes.geometry.texture
+        - nodes.geometry.grid
+        - nodes.geometry.groups
+        - nodes.geometry.geometry
+        - nodes.geometry.attribute
+        - nodes.geometry.vector
+        - nodes.geometry.manual
+        - nodes.geometry.zone
+
+    - title: Shader Nodes
+      desc: Nodes use in Material / Shader node trees
+      contents:
+        - nodes.shader.color
+        - nodes.shader.converter
+        - nodes.shader.grid
+        - nodes.shader.group
+        - nodes.shader.input
+        - nodes.shader.manual
+        - nodes.shader.output
+        - nodes.shader.script
+        - nodes.shader.shader
+        - nodes.shader.texture
+        - nodes.shader.vector
+    - title: Compositor Nodes
+      desc: Nodes for use in the compositor
+      contents:
+        - nodes.compositor.color
+        - nodes.compositor.converter
+        - nodes.compositor.distort
+        - nodes.compositor.filter
+        - nodes.compositor.group
+        - nodes.compositor.input
+        - nodes.compositor.interface
+        - nodes.compositor.manual
+        - nodes.compositor.matte
+        - nodes.compositor.output
+        - nodes.compositor.vector

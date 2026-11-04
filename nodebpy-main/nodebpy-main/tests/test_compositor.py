@@ -1,0 +1,184 @@
+import pytest
+
+from nodebpy import compositor as c
+from nodebpy.export import to_python
+
+
+def test_initial_compositor(snapshot):
+    with c.tree("comp", fake_user=True) as t:
+        image = t.inputs.color("Image")
+        depth = t.inputs.float("Depth")
+        normal = t.inputs.vector("Normal")
+        ao = t.inputs.float("AO")
+        background_menu = t.inputs.menu("Background", "Output")
+        background_color = t.inputs.color("Background Color")
+        outline_menu = t.inputs.menu(
+            "Outline", "Outline", expanded=True, optional_label=True
+        )
+        outline_depth = t.inputs.float("Socket Depth", 5.0)
+        outline_size = t.inputs.integer("Outline Size", 2)
+        outline_color = t.inputs.color("Outline Color")
+
+        output_color = t.outputs.color("Image")
+
+        with c.Frame("Ambient Occlusion"):
+            ao_factor = (1 - ao) ** 0.94 >> c.Kuwahara(size=4.0)
+            active_image = c.Mix.color(ao_factor, image)
+        with c.Frame("Outline"):
+            depth_line = depth >> c.Filter.sobel() > (outline_depth / 100)
+            normal_line = normal >> c.Filter.sobel() > 1.5
+            outline_comp = (
+                (depth_line + normal_line)
+                >> c.AntiAliasing()
+                >> c.DilateErode.distance(size=outline_size - 1.0)
+                >> c.AntiAliasing()
+            )
+
+        with c.Frame("Final Composit"):
+            outline_switch = c.MenuSwitch.color(
+                outline_menu,
+                {
+                    "None": active_image,
+                    "Outline": c.AlphaOver(outline_comp, outline_color),
+                },
+            )
+
+            _ = (
+                c.MenuSwitch.color(
+                    background_menu,
+                    {
+                        "Output": outline_switch,
+                        "Image": c.AlphaOver(background_color, outline_switch),
+                    },
+                )
+                >> output_color
+            )
+    assert snapshot == t._repr_markdown_()
+
+
+def test_compositor_menu_switch():
+    with c.tree() as tree:
+        menu = c.MenuSwitch.string(items={str(x): str(x) for x in range(10)})
+        menu >> tree.outputs.string()
+
+    assert len(menu.node.enum_items) == 10
+    assert menu.node.outputs[0].links
+
+    with c.tree() as tree:
+        menu = c.MenuSwitch.float(
+            items={f"Input_{i}": float(value) for i, value in enumerate(range(10))}
+        )
+        menu >> tree.outputs.float()
+
+    assert len(menu.node.enum_items) == 10
+    for i, input in enumerate([x for x in menu.i._values() if x.type == "VALUE"]):
+        assert f"Input_{i}" == input.name
+        assert float(i) == input.socket.default_value
+
+    with c.tree() as tree:
+        menu = c.MenuSwitch.float(
+            items={f"Input_{i}": c.Value(value) for i, value in enumerate(range(10))}
+        )
+        menu >> tree.outputs.float()
+
+    assert len(menu.node.enum_items) == 10
+    for i, input in enumerate([x for x in menu.i._values() if x.type == "VALUE"]):
+        assert f"Input_{i}" == input.name
+        assert input.socket.links[0].from_node.bl_idname == c.Value._bl_idname
+        # we have to check the output defeault value here because that is how the Value
+        # node is defined which is truly cursed but hey it is what it is
+        assert input.socket.links[0].from_node.outputs[0].default_value == float(i)
+
+
+def test_nodes():
+    with c.tree():
+        idx = c.IndexSwitch.vector()
+        assert idx.data_type == "VECTOR"
+        idx.data_type = "FLOAT"
+        assert idx.data_type == "FLOAT"
+
+
+def test_enable_output_data_type_setter():
+    with c.tree():
+        node = c.EnableOutput()
+        assert node.data_type == "FLOAT"
+        node.data_type = "INT"
+        assert node.data_type == "INT"
+
+
+def test_image_node_properties():
+    with c.tree():
+        img = c.Image()
+        # has_layers / has_views are readable regardless of scene render layers
+        assert isinstance(img.has_layers, bool)
+        assert isinstance(img.has_views, bool)
+
+
+def test_cryptomatte_layer_name():
+    with c.tree():
+        # layer_name is a plain string property (unlike layer/view which are render enums)
+        crypto = c.Cryptomatte(layer_name="ViewLayer.CryptoObject")
+        assert crypto.layer_name == "ViewLayer.CryptoObject"
+        crypto.layer_name = "ViewLayer.CryptoMaterial"
+        assert crypto.layer_name == "ViewLayer.CryptoMaterial"
+
+
+def test_convert_colorspace_properties():
+    with c.tree():
+        node = c.ConvertColorspace(
+            from_color_space="sRGB", to_color_space="scene_linear"
+        )
+        assert node.from_color_space == "sRGB"
+        assert node.to_color_space == "scene_linear"
+        node.from_color_space = "scene_linear"
+        node.to_color_space = "sRGB"
+        assert node.from_color_space == "scene_linear"
+        assert node.to_color_space == "sRGB"
+
+
+def test_simple_compositor_nodes():
+    with c.tree():
+        mix = c.Mix.float()
+        assert mix.data_type == "FLOAT"
+        mix.data_type = "VECTOR"
+        assert mix.data_type == "VECTOR"
+
+
+def test_compositor_file_output():
+    with c.tree():
+        f = c.FileOutput()
+
+        assert f.save_as_render
+        f.save_as_render = False
+        assert not f.save_as_render
+        assert f.use_file_extension
+        f.use_file_extension = False
+        assert not f.use_file_extension
+
+
+def test_color_balance_whitepoint_argument_is_kept():
+    """The white point is stored in the temperature and tint sockets, so it is
+    applied after them rather than being overwritten by their defaults."""
+    with c.tree() as tree:
+        node = c.ColorBalance.white_point(input_whitepoint=(1.0, 0.6, 0.3))
+    assert node.i.input_temperature.default_value != pytest.approx(6500.0)
+    code = to_python(tree)
+    assert "whitepoint" not in code
+    assert "input_temperature=" in code
+
+
+def test_noise_texture_dimensions_follow_the_tree():
+    """Blender starts Noise Texture at 2D in the compositor and 3D elsewhere."""
+    from nodebpy import shader as s
+
+    with c.tree() as comp:
+        noise = c.NoiseTexture()
+    assert noise.noise_dimensions == "2D"
+    assert "noise_dimensions" not in to_python(comp)
+    with s.tree() as shade:
+        noise = s.NoiseTexture()
+    assert noise.noise_dimensions == "3D"
+    assert "noise_dimensions" not in to_python(shade)
+    with c.tree() as comp:
+        c.NoiseTexture(noise_dimensions="3D")
+    assert 'noise_dimensions="3D"' in to_python(comp)

@@ -1,0 +1,445 @@
+from __future__ import annotations
+
+from types import EllipsisType
+from typing import TYPE_CHECKING, Any, Self, TypeVar, cast, overload
+
+from bpy.types import NodeLink, NodeSocket
+
+from ..types import Default
+from ._registry import _wrap_socket
+from ._utils import SocketError, _resolve_promotion, _SocketLike
+
+_RShiftT = TypeVar("_RShiftT")
+_OutT = TypeVar("_OutT", bound="BaseSocket")
+
+_MIRRORED_COMPARISONS = {
+    "less_than": "greater_than",
+    "greater_than": "less_than",
+    "less_equal": "greater_equal",
+    "greater_equal": "less_equal",
+}
+_BIT_MATH_OPERATIONS = {"l_and": "l_and", "l_or": "l_or", "not_equal": "exclusive_or"}
+
+if TYPE_CHECKING:
+    from ..nodes.geometry import CombineTransform
+    from ..nodes.geometry.converter import BooleanMath
+    from ..types import InputLinkable
+    from .accessor import SocketAccessor
+    from .items import Item
+    from .node import BaseNode
+    from .socket import (
+        BaseSocket,
+        BooleanSocket,
+        FloatSocket,
+        MatrixSocket,
+        Position,
+        Socket,
+        VectorSocket,
+    )
+    from .tree import TreeBuilder
+
+
+class OperatorMixin:
+    """All arithmetic, comparison, boolean, and matrix operator overloads.
+
+    Requires ``_default_output_socket`` on the concrete class.
+    Delegates all dispatch to type-specific ``_dispatch_*`` methods on Socket
+    subclasses, looked up via ``_wrap_socket``.
+    """
+
+    __array_ufunc__ = None
+
+    if TYPE_CHECKING:
+
+        @property
+        def _default_output_socket(self) -> NodeSocket: ...
+
+    def _apply_math_operation(
+        self, other: Any, operation: str, reverse: bool = False
+    ) -> Socket:
+        socket, other, reverse = _resolve_promotion(
+            self._default_output_socket,
+            other,
+            reverse,
+        )
+        return _wrap_socket(socket)._dispatch_math(other, operation, reverse)
+
+    def __mul__(self, other: Any) -> Socket:
+        return self._apply_math_operation(other, "multiply")
+
+    def __rmul__(self, other: Any) -> Socket:
+        return self._apply_math_operation(other, "multiply", reverse=True)
+
+    def __truediv__(self, other: Any) -> Socket:
+        return self._apply_math_operation(other, "divide")
+
+    def __rtruediv__(self, other: Any) -> Socket:
+        return self._apply_math_operation(other, "divide", reverse=True)
+
+    def __add__(self, other: Any) -> Socket:
+        return self._apply_math_operation(other, "add")
+
+    def __radd__(self, other: Any) -> Socket:
+        return self._apply_math_operation(other, "add", reverse=True)
+
+    def __sub__(self, other: Any) -> Socket:
+        return self._apply_math_operation(other, "subtract")
+
+    def __rsub__(self, other: Any) -> Socket:
+        return self._apply_math_operation(other, "subtract", reverse=True)
+
+    def __pow__(self, other: Any) -> Socket:
+        return self._apply_math_operation(other, "power")
+
+    def __rpow__(self, other: Any) -> Socket:
+        return self._apply_math_operation(other, "power", reverse=True)
+
+    def __mod__(self, other: Any) -> Socket:
+        return self._apply_math_operation(other, "modulo")
+
+    def __rmod__(self, other: Any) -> Socket:
+        return self._apply_math_operation(other, "modulo", reverse=True)
+
+    def __floordiv__(self, other: Any) -> Socket:
+        socket, other, reverse = _resolve_promotion(
+            self._default_output_socket,
+            other,
+            False,
+        )
+        return _wrap_socket(socket)._dispatch_floordiv(other, reverse)
+
+    def __rfloordiv__(self, other: Any) -> Socket:
+        socket, other, reverse = _resolve_promotion(
+            self._default_output_socket,
+            other,
+            True,
+        )
+        return _wrap_socket(socket)._dispatch_floordiv(other, reverse)
+
+    def __matmul__(
+        self, other: Position | CombineTransform | VectorSocket | MatrixSocket
+    ) -> Socket:
+        from ..builder.socket import VectorSocket
+        from ..nodes.geometry import (
+            MultiplyMatrices,
+            Position,
+            TransformPoint,
+        )
+
+        if isinstance(other, (Position, VectorSocket)):
+            return TransformPoint(other, self).o.vector  # ty: ignore[invalid-argument-type]
+
+        return MultiplyMatrices(self, other).o.matrix  # ty: ignore[invalid-argument-type]
+
+    def __rmatmul__(self, other: Any) -> Socket:
+        from ..builder.socket import VectorSocket
+        from ..nodes.geometry import MultiplyMatrices, Position, TransformPoint
+
+        if isinstance(
+            self,
+            (
+                VectorSocket,
+                Position,
+            ),
+        ):
+            return TransformPoint(self, other).o.vector
+
+        return MultiplyMatrices(other, self).o.matrix  # ty: ignore[invalid-argument-type]
+
+    def __neg__(self) -> Socket:
+        return _wrap_socket(self._default_output_socket)._dispatch_unary("negate")
+
+    def __abs__(self) -> Socket:
+        return _wrap_socket(self._default_output_socket)._dispatch_unary("absolute")
+
+    def _apply_compare_operation(
+        self, other: Any, operation: str
+    ) -> FloatSocket | BooleanSocket:
+        socket, other, reverse = _resolve_promotion(
+            self._default_output_socket,
+            other,
+            False,
+        )
+        # promotion swapped the operands, so mirror the comparison
+        if reverse:
+            operation = _MIRRORED_COMPARISONS.get(operation, operation)
+        return _wrap_socket(socket)._dispatch_compare(other, operation)
+
+    def __lt__(self, other: Any) -> FloatSocket | BooleanSocket:
+        return self._apply_compare_operation(other, "less_than")
+
+    def __gt__(self, other: Any) -> FloatSocket | BooleanSocket:
+        return self._apply_compare_operation(other, "greater_than")
+
+    def __le__(self, other: Any) -> FloatSocket | BooleanSocket:
+        return self._apply_compare_operation(other, "less_equal")
+
+    def __ge__(self, other: Any) -> FloatSocket | BooleanSocket:
+        return self._apply_compare_operation(other, "greater_equal")
+
+    def __eq__(self, other: object) -> FloatSocket | BooleanSocket:  # type: ignore
+        return self._apply_compare_operation(other, "equal")
+
+    def __ne__(self, other: object) -> FloatSocket | BooleanSocket:  # type: ignore
+        return self._apply_compare_operation(other, "not_equal")
+
+    def _apply_boolean_operation(
+        self, other: Any, operation: str, reverse: bool = False
+    ) -> BooleanMath | Socket:
+        # Integers take the bitwise path, as Python's ``&``/``|``/``^`` do;
+        # Boolean Math would cast them to booleans.
+        if self._default_output_socket.type == "INT":
+            from ..nodes.geometry.converter import BitMath
+
+            values = (other, self) if reverse else (self, other)
+            return getattr(BitMath, _BIT_MATH_OPERATIONS[operation])(*values).o.value
+        from ..nodes.geometry.converter import BooleanMath
+
+        values = (other, self) if reverse else (self, other)
+        return getattr(BooleanMath, operation)(*values)
+
+    def __and__(self, other: Any) -> BooleanMath | Socket:
+        return self._apply_boolean_operation(other, "l_and")
+
+    def __rand__(self, other: Any) -> BooleanMath | Socket:
+        return self._apply_boolean_operation(other, "l_and", reverse=True)
+
+    def __or__(self, other: Any) -> BooleanMath | Socket:
+        return self._apply_boolean_operation(other, "l_or")
+
+    def __ror__(self, other: Any) -> BooleanMath | Socket:
+        return self._apply_boolean_operation(other, "l_or", reverse=True)
+
+    def __xor__(self, other: Any) -> BooleanMath | Socket:
+        return self._apply_boolean_operation(other, "not_equal")
+
+    def __rxor__(self, other: Any) -> BooleanMath | Socket:
+        return self._apply_boolean_operation(other, "not_equal", reverse=True)
+
+    def __invert__(self) -> BooleanMath | Socket:
+        if self._default_output_socket.type == "INT":
+            from ..nodes.geometry.converter import BitMath
+
+            return BitMath.l_not(cast(Any, self)).o.value
+        from ..nodes.geometry.converter import BooleanMath
+
+        return BooleanMath.l_not(cast(Any, self))
+
+
+class LinkingMixin:
+    """Node/socket linking logic: ``>>``, ``_link``, best-socket matching.
+
+    Requires ``tree``, ``i``, ``o``, ``_default_output_socket``,
+    and ``_default_input_socket`` on the concrete class.
+    """
+
+    tree: TreeBuilder[Any]
+
+    if TYPE_CHECKING:
+        import bpy
+
+        node: bpy.types.Node
+
+        @property
+        def i(self) -> SocketAccessor: ...
+
+        @property
+        def o(self) -> SocketAccessor: ...
+
+        @property
+        def _default_output_socket(self) -> NodeSocket: ...
+
+    def _source_socket(self, node: InputLinkable | Socket | NodeSocket) -> NodeSocket:
+        assert node is not None
+        if isinstance(node, Default):
+            raise TypeError(f"{node} marks an input's fallback, it cannot be linked")
+        if isinstance(node, NodeSocket):
+            return node
+        elif hasattr(node, "_default_output_socket"):
+            return node._default_output_socket  # type: ignore[union-attr]
+        else:
+            raise TypeError(f"Unsupported type: {type(node)}")
+
+    def _target_socket(self, node: InputLinkable | Socket | NodeSocket) -> NodeSocket:
+        assert node is not None
+        if isinstance(node, Default):
+            raise TypeError(f"{node} marks an input's fallback, it cannot be linked")
+        if isinstance(node, NodeSocket):
+            return node
+        elif hasattr(node, "_default_input_socket"):
+            return node._default_input_socket  # type: ignore[union-attr]
+        else:
+            raise TypeError(f"Unsupported type: {type(node)}")
+
+    def _find_best_socket_pair(
+        self,
+        source: BaseNode | Socket | NodeSocket | EllipsisType | LinkingMixin,
+        target: BaseNode | Socket | NodeSocket | EllipsisType | LinkingMixin,
+    ) -> tuple[NodeSocket, NodeSocket]:
+        """Find the best compatible pair of sockets between two nodes/sockets."""
+        from ..builder.node import BaseNode
+        from ..builder.socket import Socket
+        from ..types import PREFER_FIRST_SOCKET, SOCKET_COMPATIBILITY
+
+        if isinstance(source, BaseNode):
+            outputs = source.o._available
+        elif isinstance(source, NodeSocket):
+            outputs = [source]
+        elif isinstance(source, Socket):
+            outputs = [source.socket]
+        else:
+            raise TypeError(f"Cannot get outputs from {type(source)}")
+
+        if isinstance(target, BaseNode):
+            inputs = target.i._available
+        elif isinstance(target, Socket):
+            inputs = [target.socket]
+        elif isinstance(target, NodeSocket):
+            inputs = [target]
+        else:
+            raise TypeError(f"Cannot get inputs from {type(target)}")
+
+        # NodeReroute adapts its type to whatever is linked — skip type matching
+        if (
+            getattr(getattr(target, "node", None), "bl_idname", None) == "NodeReroute"
+            and outputs
+            and inputs
+        ):
+            return inputs[0], outputs[0]
+
+        def best_pair(inputs: list[NodeSocket]) -> tuple[NodeSocket, NodeSocket] | None:
+            possible_combos = []
+            # Try first available input first — if the output type matches it exactly,
+            # or is a "preferred" implicit conversion (e.g. float→color, vector→color),
+            # use the first socket rather than searching for a better-typed later one.
+            # This keeps float→Image working in the compositor instead of drifting to
+            # a float Factor socket that scores higher on raw compatibility.
+            # Pairs not in PREFER_FIRST_SOCKET (e.g. VALUE→BOOLEAN, VECTOR→ROTATION)
+            # fall through to the ranked search below.
+            if inputs:
+                first_input = inputs[0]
+                for output in outputs:
+                    if first_input.type == output.type:
+                        return first_input, output
+                    if (output.type, first_input.type) in PREFER_FIRST_SOCKET:
+                        return first_input, output
+
+            for output in outputs:
+                compat_sockets = SOCKET_COMPATIBILITY.get(output.type, ())
+                for input in inputs:
+                    if input.type == output.type:
+                        return input, output
+
+                    if input.type in compat_sockets:
+                        possible_combos.append(
+                            (compat_sockets.index(input.type), (input, output))
+                        )
+
+            if possible_combos:
+                return min(possible_combos, key=lambda x: x[0])[1]
+
+            # A node with a virtual ``__extend__`` input (Viewer, …) accepts any
+            # source: linking to it makes Blender create a typed socket. Fall back
+            # to it when nothing else matched, pairing with the source's first
+            # available output.
+            extend = next(
+                (i for i in inputs if i.identifier.startswith("__extend__")), None
+            )
+            if extend is not None and outputs:
+                return extend, outputs[0]
+            return None
+
+        pair = best_pair(inputs)
+        # Nothing active fits: fall back to inactive inputs Blender still lets
+        # the user link (a group input unused at the current values).
+        if pair is None and isinstance(target, BaseNode):
+            fallback = target.i._inactive_fallback
+            if fallback:
+                pair = best_pair(fallback)
+        if pair is not None:
+            return pair
+
+        src_name = getattr(getattr(source, "node", None), "name", repr(source))
+        tgt_name = getattr(getattr(target, "node", None), "name", repr(target))
+        raise SocketError(
+            f"Cannot link any output from {src_name} to any input of {tgt_name}. "
+            f"Available output types: {[f'{o.name}:{o.type}' for o in outputs]}, "
+            f"Available input types: {[f'{i.name}:{i.type}' for i in inputs]}"
+        )
+
+    def _link(
+        self, source: InputLinkable | Socket | NodeSocket, target: InputLinkable
+    ) -> NodeLink:
+        source_socket = self._source_socket(source)
+        target_socket = self._target_socket(target)
+        return self.tree.link(source_socket, target_socket)
+
+    def _link_from(
+        self,
+        source: InputLinkable,
+        input: InputLinkable | str,
+    ):
+        from .node import _find_socket_from_name
+
+        if isinstance(input, str):
+            self._link(source, _find_socket_from_name(self.node.inputs, input))
+        else:
+            self._link(source, input)
+
+    @overload
+    def __rshift__(self, other: None) -> Self: ...
+    @overload
+    def __rshift__(self, other: Item[Any, _OutT]) -> _OutT: ...
+    @overload
+    def __rshift__(self, other: _RShiftT) -> _RShiftT: ...
+    def __rshift__(self, other: _RShiftT | None) -> _RShiftT | Self:
+        """Chain nodes using >> operator. Links output to input.
+
+        Usage:
+            node1 >> node2 >> node3
+            tree.inputs.value >> Math.add(..., 0.1) >> tree.outputs.result
+
+        If the target node has an ellipsis placeholder (...), links to that specific input.
+        Otherwise, finds the best compatible socket pair based on type compatibility.
+
+        Returns the right-hand node to enable continued chaining, or the
+        other side of an item whose role socket was the target. A ``None``
+        target is a no-op passthrough — nothing is linked and ``self`` is
+        returned so an optional node can be conditionally skipped::
+
+            src >> SetPosition() >> (Transform() if trans else None) >> out
+        """
+        if other is None:
+            return self
+        as_target = getattr(other, "_as_rshift_target", None)
+        if as_target is not None:
+            # an item handle stands for its input socket on the right of >>
+            return self >> as_target()
+        if isinstance(other, _SocketLike):
+            source = self._default_output_socket
+            target = other.socket
+        elif getattr(other, "_placeholder_inputs", None):
+            node_other = cast("BaseNode", other)
+            name = node_other._placeholder_inputs.pop(0)
+            try:
+                target = node_other.node.inputs[name]
+            except KeyError:
+                target = node_other.node.inputs[node_other.i._index(name)]
+            source = (
+                self.o._best_match(target.type)
+                if hasattr(self, "o")
+                else self._default_output_socket
+            )
+        else:
+            try:
+                source, target = self._find_best_socket_pair(self, cast(Any, other))
+            except SocketError:
+                source, target = cast("LinkingMixin", other)._find_best_socket_pair(
+                    self, cast(Any, other)
+                )
+
+        self.tree.link(source, target)
+        # an item's role socket continues the chain from the item's other
+        # side (``>> item.input`` carries on from ``item.output``)
+        follow = getattr(other, "_chain_to", None)
+        return other if follow is None else follow()

@@ -1,0 +1,15 @@
+#!/bin/sh
+set -e
+
+# Skip in worktrees of branches without source (e.g. gh-pages from `quarto publish`)
+[ -d src ] || exit 0
+
+echo "→ ruff format"
+uv run ruff format src/ gen/
+
+echo "→ ruff check --fix"
+uv run ruff check --fix src/ gen/
+
+echo "→ ty check --fix"
+uv run ty check --fix src/
+git add -u

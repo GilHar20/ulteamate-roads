@@ -1,0 +1,23 @@
+# Python-generated files
+__pycache__/
+*.py[oc]
+build/
+dist/
+wheels/
+*.egg-info
+
+# Virtual environments
+.venv
+/README_files
+tests/blend_files/*.blend
+tests/blend_files/*.blend1
+/.quarto/
+**/*.quarto_ipynb
+/docs/_build
+/docs/reference
+docs/objects.json
+/docs/_inv
+/docs/_variables.yml
+tests/plots/*.png
+.coverage
+docs/examples/images/

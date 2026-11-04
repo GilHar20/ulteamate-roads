@@ -1,0 +1,6735 @@
+"""Generate Python code from a Blender node tree using nodebpy.
+
+The generator walks the tree in topological order and builds a small
+expression IR for each node, then renders statements. Three behaviours make
+the output read like hand-written nodebpy code:
+
+* **Inlining** — a node whose output is consumed exactly once is embedded in
+  its consumer's expression instead of being assigned to a variable.
+* **Chain stitching** — runs of geometry/shader links through first sockets
+  are rendered with the ``>>`` operator.
+* **Operator lifting** — Math/VectorMath/IntegerMath/BooleanMath nodes whose
+  operation has a Python operator equivalent are rendered as ``a + b`` style
+  expressions, mirroring nodebpy's operator overloads.
+
+Nodes that need bespoke treatment (zones, dynamic-socket nodes, …) can
+register a custom emitter with :func:`register_emitter`.
+"""
+
+from __future__ import annotations
+
+import ast
+import heapq
+import inspect
+import json
+import keyword
+import re
+import textwrap
+from collections import Counter
+from collections.abc import Callable, Collection, Iterator, Mapping
+from contextlib import contextmanager
+from contextvars import ContextVar
+from dataclasses import dataclass, field
+from functools import cache
+from types import ModuleType
+from typing import TYPE_CHECKING, Any, Literal, NamedTuple
+
+import numpy as np
+from bpy.types import ID, FunctionNodeCompare, Node, NodeSocket, NodeTree
+
+from ..types import Default
+from ._floats import (
+    fmt_float as _fmt_float,
+)
+
+if TYPE_CHECKING:
+    from ..builder.tree import TreeBuilder
+
+
+class CodegenError(Exception):
+    """Raised when a node tree cannot be faithfully expressed as code."""
+
+
+# ---------------------------------------------------------------------------
+# Expression IR
+#
+# Strings are only produced in render(); parenthesisation is decided from
+# Python operator precedence, so emitters can compose expressions freely.
+# ---------------------------------------------------------------------------
+
+_ATOM_PREC = 100
+_UNARY_PREC = 11
+
+_BINOP_PREC: dict[str, int] = {
+    "|": 5,
+    "^": 6,
+    "&": 7,
+    ">>": 8,
+    "+": 9,
+    "-": 9,
+    "*": 10,
+    "/": 10,
+    "//": 10,
+    "%": 10,
+    "@": 10,
+    "**": 12,
+}
+
+_RIGHT_ASSOC = frozenset({"**"})
+
+
+class Expr:
+    """Base class for renderable expressions."""
+
+    prec: int = _ATOM_PREC
+
+    def render(self) -> str:
+        raise NotImplementedError
+
+    @staticmethod
+    def _child(child: Expr, parens: bool) -> str:
+        text = child.render()
+        return f"({text})" if parens else text
+
+
+@dataclass
+class Raw(Expr):
+    """Verbatim source text (escape hatch for custom emitters)."""
+
+    text: str
+
+    def render(self) -> str:
+        return self.text
+
+
+@dataclass
+class Lit(Expr):
+    """A Python literal, formatted via :func:`_fmt`."""
+
+    value: Any
+
+    def render(self) -> str:
+        return _fmt(self.value)
+
+    @property
+    def prec(self) -> int:  # type: ignore[override]
+        # A float can format as a compound math-constant expression
+        # (``2 * math.pi``, ``math.tau / 3``), which must parenthesise like
+        # the operators in it; a bare ``math.e`` stays an atom.
+        if isinstance(self.value, float):
+            text = _fmt(self.value)
+            if "math." in text and " " in text:
+                return _BINOP_PREC["*"]
+        return _ATOM_PREC
+
+
+@dataclass
+class Ref(Expr):
+    """A variable reference."""
+
+    name: str
+
+    def render(self) -> str:
+        return self.name
+
+
+@dataclass
+class Attr(Expr):
+    """Attribute access; ``name`` may be dotted (e.g. ``"o.color"``)."""
+
+    base: Expr
+    name: str
+
+    def render(self) -> str:
+        return f"{self._child(self.base, self.base.prec < _ATOM_PREC)}.{self.name}"
+
+
+@dataclass
+class Subscript(Expr):
+    """Subscript access (``expr["key"]``), for socket names that are not valid
+    Python identifiers (e.g. ``value.o["Physics (Experimental)"]``)."""
+
+    base: Expr
+    key: Expr
+
+    def render(self) -> str:
+        return f"{self._child(self.base, self.base.prec < _ATOM_PREC)}[{self.key.render()}]"
+
+
+@dataclass
+class Call(Expr):
+    """A call ``func(args, kwargs)``; ``func`` is rendered verbatim."""
+
+    func: str
+    args: list[Expr] = field(default_factory=list)
+    kwargs: dict[str, Expr] = field(default_factory=dict)
+
+    def render(self) -> str:
+        parts = [a.render() for a in self.args]
+        parts += [f"{k}={v.render()}" for k, v in self.kwargs.items()]
+        return f"{self.func}({', '.join(parts)})"
+
+
+@dataclass
+class TupleExpr(Expr):
+    """A tuple literal, used for multi-input sockets (e.g. JoinGeometry)."""
+
+    items: list[Expr]
+
+    def render(self) -> str:
+        rendered = [item.render() for item in self.items]
+        if len(rendered) == 1:
+            return f"({rendered[0]},)"
+        return f"({', '.join(rendered)})"
+
+
+@dataclass
+class DictExpr(Expr):
+    """A dict literal with string keys, used for ``items=`` kwargs."""
+
+    items: dict[str, Expr]
+
+    def render(self) -> str:
+        inner = ", ".join(f"{_fmt(k)}: {v.render()}" for k, v in self.items.items())
+        return "{" + inner + "}"
+
+
+@dataclass
+class GroupCall(Expr):
+    """``ClassName(Socket=value, ...)`` for a generated group class.
+
+    ``_establish_links`` matches inputs by socket name, so names that are
+    valid Python identifiers pass as plain keyword arguments; the rest
+    (``"Box Object"``) ride in a ``**{...}`` unpacking, spliced in place so
+    the socket order is preserved. Inputs whose name is shared by several
+    interface sockets are ambiguous as keywords/dict keys, so they ride in
+    ``named_links`` — ``(name, value)`` pairs resolved by name + type at
+    link time.
+    """
+
+    func: str
+    items: dict[str, Expr]
+    named_links: list[tuple[str, Expr]] = field(default_factory=list)
+
+    def render(self) -> str:
+        parts: list[str] = []
+        raw: dict[str, Expr] = {}
+
+        def flush_raw() -> None:
+            if raw:
+                inner = ", ".join(f"{_fmt(k)}: {v.render()}" for k, v in raw.items())
+                parts.append(f"**{{{inner}}}")
+                raw.clear()
+
+        for k, v in self.items.items():
+            # "self" and "_named_links" are taken by the __init__ signature
+            # itself, so those socket names must stay dict-packed too.
+            if (
+                k.isidentifier()
+                and not keyword.iskeyword(k)
+                and k not in ("self", "_named_links")
+            ):
+                flush_raw()
+                parts.append(f"{k}={v.render()}")
+            else:
+                raw[k] = v
+        flush_raw()
+        if self.named_links:
+            pairs = ", ".join(f"({_fmt(k)}, {v.render()})" for k, v in self.named_links)
+            parts.append(f"_named_links=[{pairs}]")
+        return f"{self.func}({', '.join(parts)})"
+
+
+@dataclass
+class MethodCall(Expr):
+    """A method call on a receiver expression, e.g. ``value.point.at(i)``.
+
+    ``method`` may be a dotted path (``"switch.float"``, ``"point.mean"``).
+    """
+
+    receiver: Expr
+    method: str
+    args: list[Expr] = field(default_factory=list)
+    kwargs: dict[str, Expr] = field(default_factory=dict)
+
+    def render(self) -> str:
+        base = self._child(self.receiver, self.receiver.prec < _ATOM_PREC)
+        parts = [a.render() for a in self.args]
+        parts += [f"{k}={v.render()}" for k, v in self.kwargs.items()]
+        return f"{base}.{self.method}({', '.join(parts)})"
+
+
+@dataclass
+class UnaryOp(Expr):
+    """A prefix unary operator (``-x``, ``~x``)."""
+
+    op: str
+    operand: Expr
+
+    prec: int = field(default=_UNARY_PREC, init=False)
+
+    def render(self) -> str:
+        return f"{self.op}{self._child(self.operand, self.operand.prec < self.prec)}"
+
+
+_COMPARE_PREC = 4  # below every binary operator
+
+
+@dataclass
+class CompareOp(Expr):
+    """A comparison expression (``a < b``).
+
+    Comparison operands are always parenthesised — Python would chain
+    ``a < b < c``, which is not what nested Compare nodes mean — and
+    comparisons bind looser than every binary operator, so they get parens
+    inside ``&``/``|``/``>>`` expressions automatically.
+    """
+
+    op: str
+    lhs: Expr
+    rhs: Expr
+
+    prec: int = field(default=_COMPARE_PREC, init=False)
+
+    def render(self) -> str:
+        lhs = self._child(self.lhs, self.lhs.prec <= self.prec)
+        rhs = self._child(self.rhs, self.rhs.prec <= self.prec)
+        return f"{lhs} {self.op} {rhs}"
+
+
+@dataclass
+class BinOp(Expr):
+    """A binary operator expression with precedence-aware rendering.
+
+    Equal-precedence right operands are always parenthesised so the rendered
+    code rebuilds the same node-graph grouping on round-trip.
+    """
+
+    op: str
+    lhs: Expr
+    rhs: Expr
+    prec: int = field(default=_ATOM_PREC, init=False)
+
+    def __post_init__(self) -> None:
+        self.prec = _BINOP_PREC[self.op]
+
+    def render(self) -> str:
+        right_assoc = self.op in _RIGHT_ASSOC
+        lhs_parens = self.lhs.prec < self.prec or (
+            self.lhs.prec == self.prec and right_assoc
+        )
+        rhs_parens = self.rhs.prec < self.prec or (
+            self.rhs.prec == self.prec and not right_assoc
+        )
+        lhs = self._child(self.lhs, lhs_parens)
+        rhs = self._child(self.rhs, rhs_parens)
+        return f"{lhs} {self.op} {rhs}"
+
+
+_MAX_LINE_WIDTH = 88
+
+
+def _stmt_lines(
+    expr: Expr,
+    assign: str | None = None,
+    indent: str = "    ",
+    width: int = _MAX_LINE_WIDTH,
+) -> list[str]:
+    """Render a statement, wrapping a top-level ``>>`` chain in parentheses
+    with one segment per line when the flat form exceeds ``width`` columns."""
+    prefix = f"{assign} = " if assign else ""
+    flat = f"{indent}{prefix}{expr.render()}"
+    if len(flat) <= width or not (isinstance(expr, BinOp) and expr.op == ">>"):
+        return [flat]
+    segments: list[Expr] = []
+    node: Expr = expr
+    while isinstance(node, BinOp) and node.op == ">>":
+        segments.append(node.rhs)
+        node = node.lhs
+    segments.append(node)
+    segments.reverse()
+    prec = _BINOP_PREC[">>"]
+    inner = indent + "    "
+    head = segments[0]
+    lines = [f"{indent}{prefix}(", f"{inner}{Expr._child(head, head.prec < prec)}"]
+    lines.extend(
+        f"{inner}>> {Expr._child(seg, seg.prec <= prec)}" for seg in segments[1:]
+    )
+    lines.append(f"{indent})")
+    return lines
+
+
+# ---------------------------------------------------------------------------
+# Value formatting
+# ---------------------------------------------------------------------------
+
+
+def _fmt(value: Any) -> str:
+    """Format a value as a Python literal using double-quoted strings."""
+    if isinstance(value, bool):
+        return str(value)
+    if isinstance(value, int):
+        return str(value)
+    if isinstance(value, float):
+        return _fmt_float(value)
+    if isinstance(value, str):
+        # json.dumps escapes control characters (newlines, tabs, …) that a
+        # naive quote/backslash replace would leave to break the literal,
+        # stays double-quoted, and leaves printable non-ASCII as-is.
+        return json.dumps(value, ensure_ascii=False)
+    if isinstance(value, ID):
+        # A datablock renders as a *guarded* lookup: repr()'s subscript form
+        # raises KeyError in any session that lacks the datablock, so a
+        # standalone script would crash at exec time; .get() degrades to an
+        # empty default instead (the dump/build pipeline pre-resolves these
+        # from DATABLOCK_DEPENDENCIES, so there the datablock is present).
+        collection = _ID_COLLECTIONS.get(value.id_type)
+        if collection is not None:
+            return f"bpy.data.{collection}.get({json.dumps(value.name, ensure_ascii=False)})"
+        return repr(value)  # pragma: no cover - ID kinds outside the table
+    # Vectors / sequences
+    try:
+        items = list(value)
+    except TypeError:
+        return repr(value)
+    if len(items) == 1:
+        # The trailing comma keeps a one-element tuple a tuple.
+        return f"({_fmt(items[0])},)"
+    return f"({', '.join(_fmt(v) for v in items)})"
+
+
+def _eq(a: Any, b: Any) -> bool:
+    """Compare two values for equality, handling vectors/sequences."""
+    if a is None and b is None:
+        return True
+    if a is None or b is None:
+        return False
+    try:
+        if isinstance(a, str) and isinstance(b, str):
+            return a == b
+        if hasattr(a, "__len__") and hasattr(b, "__len__"):
+            if len(a) != len(b):
+                return False
+            return all(_eq(x, y) for x, y in zip(a, b))
+        if isinstance(a, (int, float)) and isinstance(b, (int, float)):
+            # Sockets store float32: a Python default of ``0.05`` reads back
+            # as ``0.05000000074505806``, so compare at that precision.
+            return bool(np.float32(a) == np.float32(b))
+        return a == b
+    except Exception:  # noqa: BLE001
+        return False
+
+
+def _is_zero(val: Any) -> bool:
+    """Return True if val is a zero-like default."""
+    if isinstance(val, bool):
+        return not val
+    if isinstance(val, (int, float)):
+        return val == 0
+    if isinstance(val, str):  # iterating a one-character string never ends
+        return val == ""
+    try:
+        return all(_is_zero(v) for v in val)
+    except TypeError:
+        return False
+
+
+# ---------------------------------------------------------------------------
+# Node registry — bl_idname → (module_alias, node class)
+# ---------------------------------------------------------------------------
+
+_NODE_REGISTRY: dict[str, tuple[str, type]] | None = None
+
+_ALIAS_MODULES = {"g": "geometry", "s": "shader", "c": "compositor"}
+
+_TREE_CONSTRUCTORS = {
+    "GeometryNodeTree": "TreeBuilder",
+    "ShaderNodeTree": "TreeBuilder.shader",
+    "CompositorNodeTree": "TreeBuilder.compositor",
+}
+
+_TREE_ALIAS = {
+    "GeometryNodeTree": "g",
+    "ShaderNodeTree": "s",
+    "CompositorNodeTree": "c",
+}
+
+# The tree being emitted, so a class shared between modules (Value, Combine XYZ,
+# Reroute, the closure and repeat zones) is written with that tree's alias.
+_CURRENT_TREE: ContextVar[str] = ContextVar("_CURRENT_TREE", default="GeometryNodeTree")
+
+_SKIP_BL_IDNAMES = frozenset(
+    {"NodeGroupInput", "NodeGroupOutput", "NodeReroute", "NodeFrame"}
+)
+
+_INTERFACE_TYPE_METHOD: dict[str, str] = {
+    "NodeSocketFloat": "float",
+    "NodeSocketInt": "integer",
+    "NodeSocketBool": "boolean",
+    "NodeSocketVector": "vector",
+    "NodeSocketColor": "color",
+    "NodeSocketRotation": "rotation",
+    "NodeSocketMatrix": "matrix",
+    "NodeSocketString": "string",
+    "NodeSocketMenu": "menu",
+    "NodeSocketObject": "object",
+    "NodeSocketGeometry": "geometry",
+    "NodeSocketCollection": "collection",
+    "NodeSocketImage": "image",
+    "NodeSocketMaterial": "material",
+    "NodeSocketFont": "font",
+    "NodeSocketSound": "sound",
+    "NodeSocketBundle": "bundle",
+    "NodeSocketClosure": "closure",
+    "NodeSocketShader": "shader",
+}
+
+# Interface datablock defaults that *do* carry meaning (emitted as bpy.data
+# lookups) despite living in _NO_DEFAULT_VALUE_TYPES below.
+_DATABLOCK_IFACE_DEFAULT_TYPES = frozenset(
+    {
+        "NodeSocketObject",
+        "NodeSocketCollection",
+        "NodeSocketImage",
+        "NodeSocketMaterial",
+        "NodeSocketFont",
+        "NodeSocketSound",
+    }
+)
+
+# ID.id_type → the bpy.data collection holding that datablock type. Drives
+# the guarded ``bpy.data.<collection>.get(...)`` spelling _fmt renders
+# datablock values as, and the dump pipeline's dependency scan
+# (nodebpy.assets._library). Node trees are deliberately absent — groups are
+# emitted as classes, never as lookups.
+_ID_COLLECTIONS: dict[str, str] = {
+    "MATERIAL": "materials",
+    "IMAGE": "images",
+    "OBJECT": "objects",
+    "COLLECTION": "collections",
+    "TEXTURE": "textures",
+    "TEXT": "texts",
+    "FONT": "fonts",
+    "SOUND": "sounds",
+    "SCENE": "scenes",
+    "MASK": "masks",
+}
+
+_NO_DEFAULT_VALUE_TYPES = frozenset(
+    {
+        "NodeSocketGeometry",
+        "NodeSocketObject",
+        "NodeSocketCollection",
+        "NodeSocketImage",
+        "NodeSocketMaterial",
+        "NodeSocketFont",
+        "NodeSocketSound",
+        "NodeSocketBundle",
+        "NodeSocketClosure",
+        "NodeSocketShader",
+    }
+)
+
+
+def _all_subclasses(cls: type):
+    for sub in cls.__subclasses__():
+        yield sub
+        yield from _all_subclasses(sub)
+
+
+def _get_node_registry() -> dict[str, tuple[str, type]]:
+    """Lazily build and return the bl_idname → (alias, class) registry."""
+    global _NODE_REGISTRY
+    if _NODE_REGISTRY is not None:
+        return _NODE_REGISTRY
+    _NODE_REGISTRY = {}
+    from ..builder.node import BaseNode
+    from ..nodes import compositor, geometry, shader
+
+    domains = [
+        ("g", geometry.__name__),
+        ("s", shader.__name__),
+        ("c", compositor.__name__),
+    ]
+    # Group bl_idnames are shared by every group/custom-group class, so a
+    # single registry entry would be arbitrary (and emit the wrong class).
+    ambiguous = {"GeometryNodeGroup", "ShaderNodeGroup", "CompositorNodeGroup"}
+    for cls in _all_subclasses(BaseNode):
+        bl_id = getattr(cls, "_bl_idname", None)
+        if not bl_id or bl_id in ambiguous:
+            continue
+        if bl_id in _NODE_REGISTRY:
+            # First match wins, except that a public class replaces a private
+            # base sharing its bl_idname (e.g. _MenuSwitchBase vs MenuSwitch) —
+            # emitted code must never reference private names.
+            existing = _NODE_REGISTRY[bl_id][1]
+            if not (
+                existing.__name__.startswith("_") and not cls.__name__.startswith("_")
+            ):
+                continue
+        for alias, prefix in domains:
+            if cls.__module__.startswith(prefix):
+                _NODE_REGISTRY[bl_id] = (alias, cls)
+                break
+    return _NODE_REGISTRY
+
+
+def _find_cls(bl_idname: str) -> tuple[str, type] | None:
+    """Return (alias, class) for a bl_idname, or None, preferring the module of
+    the tree being emitted when it has the class."""
+    found = _get_node_registry().get(bl_idname)
+    if found is None:  # the registry decides what is supported; the tree only the alias
+        return None
+    local = _tree_registry(_CURRENT_TREE.get()).get(bl_idname)
+    if local is None:
+        return found
+    if found is not None and local[1] is not found[1] and found[1] in local[2]:
+        # the module re-exports the registry's own choice under its alias
+        return local[0], found[1]
+    return local[0], local[1]
+
+
+_TREE_REGISTRIES: dict[str, dict[str, tuple[str, type, set[type]]]] = {}
+
+
+def _tree_registry(tree_idname: str) -> dict[str, tuple[str, type, set[type]]]:
+    """bl_idname → (alias, class, every class the module exports for it) for
+    one tree type's module."""
+    if tree_idname not in _TREE_REGISTRIES:
+        from ..builder.node import BaseNode
+        from ..nodes import compositor, geometry, shader
+
+        alias = _TREE_ALIAS.get(tree_idname, "g")
+        module = {"g": geometry, "s": shader, "c": compositor}[alias]
+        registry: dict[str, tuple[str, type, set[type]]] = {}
+        for name, cls in vars(module).items():
+            if (
+                name.startswith("_")
+                or not isinstance(cls, type)
+                or not issubclass(cls, BaseNode)
+                or not getattr(cls, "_bl_idname", None)
+            ):
+                continue
+            bl_id = cls._bl_idname
+            if bl_id in registry:
+                registry[bl_id][2].add(cls)
+            else:
+                registry[bl_id] = (alias, cls, {cls})
+        _TREE_REGISTRIES[tree_idname] = registry
+    return _TREE_REGISTRIES[tree_idname]
+
+
+def _tree_alias(ctx: EmitContext, name: str) -> str:
+    """``<alias>.<name>`` for a class the emitted tree's module exports, falling
+    back to the geometry module; records the alias for the imports."""
+    from ..nodes import compositor, geometry, shader
+
+    alias = _TREE_ALIAS.get(ctx.node_tree.bl_idname, "g")
+    module = {"g": geometry, "s": shader, "c": compositor}[alias]
+    if not hasattr(module, name):
+        alias = "g"
+    ctx.used_aliases.add(alias)
+    return f"{alias}.{name}"
+
+
+# ---------------------------------------------------------------------------
+# Blender socket defaults — probed on a scratch tree, never the user's tree
+# ---------------------------------------------------------------------------
+
+
+# Signatures are read for every constructor call emitted; they do not change.
+_signature = cache(inspect.signature)
+
+# Constant input nodes, whose value is passed positionally whatever else the
+# call carries (``g.Integer(5)``, ``g.Vector((1.0, 0.0, 0.0), vector_dimensions=2)``).
+_CONSTANT_INPUT_NODES = frozenset(
+    {
+        "FunctionNodeInputBool",
+        "FunctionNodeInputColor",
+        "FunctionNodeInputInt",
+        "FunctionNodeInputIntVector",
+        "FunctionNodeInputRotation",
+        "FunctionNodeInputString",
+        "FunctionNodeInputVector",
+    }
+)
+
+
+def _constructor_call(func: str, cls: type, node, kwargs: dict[str, Expr]) -> Call:
+    """``func(**kwargs)``, passing the constructor's first parameter
+    positionally for a constant input node or when it is the only argument
+    (``g.Points(count)``, but ``g.SetPosition(offset=...)``)."""
+    if kwargs and (node.bl_idname in _CONSTANT_INPUT_NODES or len(kwargs) == 1):
+        params = list(_signature(cls.__init__).parameters.values())[1:]
+        if (
+            params
+            and params[0].kind is inspect.Parameter.POSITIONAL_OR_KEYWORD
+            and params[0].name in kwargs
+        ):
+            kwargs = dict(kwargs)
+            first = kwargs.pop(params[0].name)
+            return Call(func, args=[first], kwargs=kwargs)
+    return Call(func, kwargs=kwargs)
+
+
+# Probe trees kept open inside probe_trees(), by tree type.
+_PROBE_TREES: dict[str, Any] = {}
+_KEEP_PROBE_TREES = False
+
+
+@contextmanager
+def probe_trees() -> Iterator[None]:
+    """Within the block, :func:`_with_probe_tree` keeps one throwaway tree
+    per tree type, emptied between probes, instead of making and removing
+    one per probe. The trees are removed on leaving the block."""
+    global _KEEP_PROBE_TREES
+    if _KEEP_PROBE_TREES:  # nested: the outer block owns the trees
+        yield
+        return
+    _KEEP_PROBE_TREES = True
+    try:
+        yield
+    finally:
+        _KEEP_PROBE_TREES = False
+        import bpy
+
+        for tree in _PROBE_TREES.values():
+            bpy.data.node_groups.remove(tree)
+        _PROBE_TREES.clear()
+
+
+def _with_probe_tree[T](tree_idname: str, fn: Callable[[Any], T], default: T) -> T:
+    """Run ``fn`` against a throwaway node tree of ``tree_idname`` and return its
+    result. Returns ``default`` if Blender is unavailable or anything goes
+    wrong. The probe tree is never the user's: it is removed afterward, or
+    emptied and kept for the next probe inside :func:`probe_trees`."""
+    try:
+        import bpy
+
+        probe_tree = _PROBE_TREES.get(tree_idname)
+        if probe_tree is None:
+            probe_tree = bpy.data.node_groups.new(
+                "__nodebpy_codegen_probe__",
+                tree_idname,  # ty: ignore[invalid-argument-type]
+            )
+            assert probe_tree is not None
+            if _KEEP_PROBE_TREES:
+                _PROBE_TREES[tree_idname] = probe_tree
+        try:
+            return fn(probe_tree)
+        finally:
+            if _KEEP_PROBE_TREES:
+                probe_tree.nodes.clear()
+                if probe_tree.interface is not None:
+                    probe_tree.interface.clear()
+            else:
+                bpy.data.node_groups.remove(probe_tree)
+    except Exception:  # noqa: BLE001
+        return default
+
+
+_BLENDER_SOCKET_DEFAULTS: dict[tuple[str, str], dict[str, object]] = {}
+
+
+def _get_blender_socket_defaults(tree_idname: str, bl_idname: str) -> dict[str, object]:
+    """Socket identifier → default value for a freshly created node of this type."""
+    key = (tree_idname, bl_idname)
+    if key in _BLENDER_SOCKET_DEFAULTS:
+        return _BLENDER_SOCKET_DEFAULTS[key]
+
+    def probe(probe_tree) -> dict[str, object]:
+        defaults: dict[str, object] = {}
+        node = probe_tree.nodes.new(bl_idname)
+        for s in node.inputs:
+            if not hasattr(s, "default_value"):
+                continue
+            val = s.default_value
+            try:
+                defaults[s.identifier] = tuple(val)
+            except TypeError:
+                defaults[s.identifier] = val
+        return defaults
+
+    defaults = _with_probe_tree(tree_idname, probe, {})
+    _BLENDER_SOCKET_DEFAULTS[key] = defaults
+    return defaults
+
+
+_NODE_OUTPUT_STRUCTURE: dict[tuple[str, str, str], str | None] = {}
+
+
+def _fresh_output_structure(
+    tree_idname: str, bl_idname: str, output_id: str
+) -> str | None:
+    """``inferred_structure_type`` of a freshly created node's output socket.
+
+    Returns ``None`` when a fresh node has no socket with that identifier.
+    A grid socket method lifts to a call on the grid *wrapper*, which the
+    rebuilt receiver only exposes when its source node reproduces the GRID
+    structure on its own (GetNamedGrid, the grid operators, …). Sources whose
+    structure is *propagated* or *dynamic* — EvaluateClosure, switches, group
+    inputs — report GRID in the authored tree but lose it on a fresh rebuild,
+    so the method would be missing; codegen falls back to the constructor for
+    them. Probed on a scratch tree, never the user's.
+    """
+    key = (tree_idname, bl_idname, output_id)
+    if key in _NODE_OUTPUT_STRUCTURE:
+        return _NODE_OUTPUT_STRUCTURE[key]
+
+    def probe(probe_tree) -> str | None:
+        node = probe_tree.nodes.new(bl_idname)
+        for s in node.outputs:
+            if s.identifier == output_id:
+                return getattr(s, "inferred_structure_type", None)
+        return None
+
+    result = _with_probe_tree(tree_idname, probe, None)
+    _NODE_OUTPUT_STRUCTURE[key] = result
+    return result
+
+
+_IFACE_DEFAULTS: dict[tuple[str, str], dict[str, object]] = {}
+
+
+def _get_interface_defaults(tree_idname: str, socket_type: str) -> dict[str, object]:
+    """Property identifier → value for a freshly created interface socket."""
+    key = (tree_idname, socket_type)
+    if key in _IFACE_DEFAULTS:
+        return _IFACE_DEFAULTS[key]
+
+    def probe(probe_tree) -> dict[str, object]:
+        defaults: dict[str, object] = {}
+        socket = probe_tree.interface.new_socket(
+            "probe", in_out="INPUT", socket_type=socket_type
+        )
+        for prop in socket.bl_rna.properties:
+            if prop.is_readonly:
+                continue
+            try:
+                value = getattr(socket, prop.identifier)
+            except Exception:  # noqa: BLE001, S112
+                continue
+            if not isinstance(value, str):
+                try:
+                    value = tuple(value)
+                except TypeError:
+                    pass
+            defaults[prop.identifier] = value
+        return defaults
+
+    defaults = _with_probe_tree(tree_idname, probe, {})
+    _IFACE_DEFAULTS[key] = defaults
+    return defaults
+
+
+# ---------------------------------------------------------------------------
+# Name utilities
+# ---------------------------------------------------------------------------
+
+
+def _normalize(name: str) -> str:
+    from ..builder._utils import normalize_name
+
+    return normalize_name(name)
+
+
+def _make_var(label: str, counter: dict[str, int]) -> str:
+    """Return a unique snake_case variable name for a node label."""
+    base = re.sub(r"_+", "_", re.sub(r"\W", "_", _normalize(label))).strip("_")
+    if not base or base[0].isdigit():
+        base = f"n_{base}" if base else "node"
+    if keyword.iskeyword(base) or base in ["g", "s", "c", "nodebpy"]:
+        base = f"{base}_"
+    # Module names the generated code may import stay off-limits: a Math
+    # node named ``math`` would shadow ``import math`` (for ``math.pi``
+    # constants), so its variables run ``math_1``, ``math_2``, …
+    if base in ("math", "bpy") and base not in counter:
+        counter[base] = 0
+    if base not in counter:
+        counter[base] = 0
+        return base
+    counter[base] += 1
+    return f"{base}_{counter[base]}"
+
+
+def _node_var_label(node) -> str:
+    """The stem for a node's generated variable name. A group node's
+    ``bl_label`` is just "Group", so it reads as its group's name instead
+    (``inverse_mass = InverseMass()``)."""
+    if node.bl_idname in _GROUP_BASES and node.node_tree is not None:
+        return node.node_tree.name
+    return node.bl_label or "node"
+
+
+# ---------------------------------------------------------------------------
+# Graph utilities
+# ---------------------------------------------------------------------------
+
+
+class _Link(NamedTuple):
+    """A node-tree link with any reroute chain collapsed away."""
+
+    from_node: Any
+    from_socket: Any
+    to_node: Any
+    to_socket: Any
+    sort_id: int = 0  # multi_input_sort_id; later-created links get higher ids
+
+
+def _trace_reroute(node, socket, node_tree):
+    """Follow a reroute chain backward to the real source node and socket."""
+    visited = set()
+    while node.bl_idname == "NodeReroute" and node.name not in visited:
+        visited.add(node.name)
+        upstream = [link for link in node_tree.links if link.to_node.name == node.name]
+        if not upstream:
+            break
+        node = upstream[0].from_node
+        socket = upstream[0].from_socket
+    return node, socket
+
+
+def _canonical_links(node_tree, links: list[_Link]) -> list[_Link]:
+    """Sort links structurally so emission never depends on insertion order.
+
+    bpy's links collection preserves creation order, which can differ
+    between runs for structurally identical trees (the arrange pass inserts
+    reroute links in set-iteration order). Sorting by node creation order
+    and socket position makes ``to_python`` a pure function of the tree's
+    structure.
+    """
+    node_idx = {n.name: i for i, n in enumerate(node_tree.nodes)}
+
+    def socket_idx(sockets, socket) -> int:
+        for i, s in enumerate(sockets):
+            if s.identifier == socket.identifier:
+                return i
+        return -1
+
+    return sorted(
+        links,
+        key=lambda link: (
+            node_idx.get(link.to_node.name, -1),
+            socket_idx(link.to_node.inputs, link.to_socket),
+            -link.sort_id,  # multi-input: creation order, as emitted
+            node_idx.get(link.from_node.name, -1),
+            socket_idx(link.from_node.outputs, link.from_socket),
+        ),
+    )
+
+
+def _effective_links(node_tree, keep_reroutes: bool = False) -> list[_Link]:
+    """All links with reroutes collapsed; reroute-internal segments dropped.
+
+    Links Blender keeps but ignores during evaluation (into sockets hidden by a
+    mode/``data_type`` switch) are excluded — see :func:`_is_ignored_link`.
+
+    With ``keep_reroutes`` the reroute chain is left intact — every raw link is
+    kept (reroutes become ordinary pass-through nodes). Returned in canonical
+    (structural) order — see :func:`_canonical_links`.
+    """
+    links: list[_Link] = []
+    for link in node_tree.links:
+        if not keep_reroutes and link.to_node.bl_idname == "NodeReroute":
+            continue
+        if _is_ignored_link(link):
+            continue
+        if keep_reroutes:
+            from_node, from_socket = link.from_node, link.from_socket
+        else:
+            from_node, from_socket = _trace_reroute(
+                link.from_node, link.from_socket, node_tree
+            )
+            if from_node.bl_idname == "NodeReroute":
+                continue  # dangling reroute with no real source
+        links.append(
+            _Link(
+                from_node,
+                from_socket,
+                link.to_node,
+                link.to_socket,
+                getattr(link, "multi_input_sort_id", 0),
+            )
+        )
+    return _canonical_links(node_tree, links)
+
+
+def _is_ignored_link(link) -> bool:
+    """True when Blender keeps this link but ignores it during evaluation.
+
+    Switching a node's mode/``data_type`` (e.g. a Mix node wired for every type,
+    then set to ``RGBA``) hides the now-irrelevant sockets but leaves their links
+    in place. Such links don't participate in evaluation, and ``TreeBuilder.link``
+    refuses to recreate them (its visibility/type guards reject the inactive,
+    often type-mismatched socket), so they aren't *effective* and must be dropped
+    consistently from emission, ordering, and structural comparison. Mirrors the
+    visibility guard in :meth:`TreeBuilder.link`.
+    """
+    from ..builder._utils import _allow_innactive_sockets
+
+    for socket, node in (
+        (link.from_socket, link.from_node),
+        (link.to_socket, link.to_node),
+    ):
+        if node.bl_idname == "NodeReroute":
+            continue  # collapsed away on rebuild — its sockets never link
+        if (
+            getattr(socket, "is_inactive", False)
+            and not _allow_innactive_sockets(node)
+            and getattr(node, "data_type", None) != socket.type
+        ):
+            return True
+    return False
+
+
+def _ordering_edges(node_tree, keep_reroutes: bool = False):
+    """(from, to) node pairs that must hold in emission order: effective
+    links (canonical order, reroutes collapsed) plus a synthetic edge from
+    each zone input node to its paired output, so the zone wrapper is
+    declared before the output side is emitted.
+
+    Links from Group Input nodes impose no order: they render as interface
+    references (bound in the interface block, before any node emits), and
+    a tree holding several instances (split inputs) must not let the
+    instances' names gate their consumers' readiness in the lexicographic
+    topological sort — which instance feeds a consumer follows link
+    creation order, so emission order would depend on the previous
+    emission and oscillate across dump → build round trips."""
+    for link in _effective_links(node_tree, keep_reroutes):
+        if (
+            link.from_node != link.to_node
+            and link.from_node.bl_idname != "NodeGroupInput"
+        ):
+            yield link.from_node, link.to_node
+    for node in node_tree.nodes:
+        paired = getattr(node, "paired_output", None)
+        if paired is not None:
+            yield node, paired
+
+
+def _topo_sort(node_tree, keep_reroutes: bool = False) -> list:
+    """Return nodes in topological order (dependencies first), ties broken by
+    node name — the nodes collection follows creation order, which a rebuild
+    shuffles, and a name tie-break keeps emission (and thus re-dumps of a
+    rebuilt tree) deterministic."""
+    nodes = list(node_tree.nodes)
+    node_by_name = {n.name: n for n in nodes}
+    in_deg: dict[str, int] = {n.name: 0 for n in nodes}
+    adj: dict[str, list[str]] = {n.name: [] for n in nodes}
+    for from_node, to_node in _ordering_edges(node_tree, keep_reroutes):
+        fn, tn = from_node.name, to_node.name
+        adj[fn].append(tn)
+        in_deg[tn] += 1
+    heap = [n.name for n in nodes if in_deg[n.name] == 0]
+    heapq.heapify(heap)
+    order = []
+    while heap:
+        name = heapq.heappop(heap)
+        order.append(node_by_name[name])
+        for m_name in adj[name]:
+            in_deg[m_name] -= 1
+            if in_deg[m_name] == 0:
+                heapq.heappush(heap, m_name)
+    if len(order) != len(nodes):
+        raise ValueError(f"Node tree {node_tree.name!r} contains a link cycle")
+    return order
+
+
+def _frame_chain(node) -> list:
+    """The ``NodeFrame``\\ s enclosing ``node``, outermost first."""
+    chain = []
+    parent = node.parent
+    while parent is not None and parent.bl_idname == "NodeFrame":
+        chain.append(parent)
+        parent = parent.parent
+    chain.reverse()
+    return chain
+
+
+def _frame_order(node_tree, ordered, keep_reroutes: bool = False):
+    """Reorder ``ordered`` so nodes sharing a frame path emit contiguously and
+    nested frames stay grouped under their parent.
+
+    Frames (including pure containers that hold only sub-frames) become nested
+    ``with g.Frame():`` blocks. At each nesting level the frame clusters are
+    cluster-topologically sorted; a frame whose cluster sits on a dependency
+    cycle is dropped (its members emit one level shallower, frameless at worst).
+
+    Returns ``(order, frame_path_of, frame_nodes)``: the reordered nodes, a map
+    from node name to its tuple of enclosing frame names (outermost first), and
+    a map from frame name to its bpy frame node.
+    """
+    chains = {n.name: _frame_chain(n) for n in ordered}
+    frame_nodes_all = {f.name: f for n in ordered for f in chains[n.name]}
+    if not frame_nodes_all:
+        return ordered, {n.name: () for n in ordered}, {}
+
+    node_by_name = {n.name: n for n in ordered}
+    in_order = set(node_by_name)
+    # The ordering edges must match how the nodes will actually be emitted:
+    # when reroutes emit as ordinary nodes, the cluster sort has to see their
+    # edges too, or reroutes end up placed before their sources.
+    edges = [
+        (a.name, b.name)
+        for a, b in _ordering_edges(node_tree, keep_reroutes)
+        if a.name in in_order and b.name in in_order
+    ]
+    dropped: set[str] = set()
+
+    def full_path(name) -> tuple[str, ...]:
+        return tuple(f.name for f in chains[name] if f.name not in dropped)
+
+    def order_level(names: list[str], depth: int):
+        """Order ``names`` (sharing a path prefix of length ``depth``) by their
+        frame at ``depth``. Returns ``(ordered_names, None)`` or, on a cycle,
+        ``(None, stuck_frame_name)``."""
+        # Cluster key: the frame name at this depth, or ("__node__", name) for a
+        # node not framed at this level (a unique, non-string key).
+        ckey: dict[str, Any] = {}
+        clusters: dict[Any, list[str]] = {}
+        order_keys: list[Any] = []
+        for name in names:
+            path = full_path(name)
+            key = path[depth] if len(path) > depth else ("__node__", name)
+            ckey[name] = key
+            if key not in clusters:
+                clusters[key] = []
+                order_keys.append(key)
+            clusters[key].append(name)
+
+        nameset = set(names)
+        adj: dict[Any, set] = {k: set() for k in order_keys}
+        in_deg = dict.fromkeys(order_keys, 0)
+        for a, b in edges:
+            if a in nameset and b in nameset:
+                ka, kb = ckey[a], ckey[b]
+                if ka != kb and kb not in adj[ka]:
+                    adj[ka].add(kb)
+                    in_deg[kb] += 1
+
+        # Kahn's algorithm preferring first-appearance order.
+        pos = {k: i for i, k in enumerate(order_keys)}
+        heap = [pos[k] for k in order_keys if in_deg[k] == 0]
+        heapq.heapify(heap)
+        result_keys: list[Any] = []
+        while heap:
+            k = order_keys[heapq.heappop(heap)]
+            result_keys.append(k)
+            for m in adj[k]:
+                in_deg[m] -= 1
+                if in_deg[m] == 0:
+                    heapq.heappush(heap, pos[m])
+        if len(result_keys) != len(order_keys):
+            stuck = next(
+                (k for k in order_keys if in_deg[k] > 0 and not isinstance(k, tuple)),
+                None,
+            )
+            return None, stuck
+
+        out: list[str] = []
+        for key in result_keys:
+            if isinstance(key, tuple):  # a single unframed node at this level
+                out.append(clusters[key][0])
+                continue
+            sub, stuck = order_level(clusters[key], depth + 1)
+            if sub is None:
+                return None, stuck
+            out.extend(sub)
+        return out, None
+
+    while True:
+        result, stuck = order_level([n.name for n in ordered], 0)
+        if result is not None:
+            order = [node_by_name[name] for name in result]
+            frame_path_of = {name: full_path(name) for name in result}
+            frame_nodes = {
+                f: node for f, node in frame_nodes_all.items() if f not in dropped
+            }
+            return order, frame_path_of, frame_nodes
+        if stuck is None:  # pragma: no cover - defensive
+            return ordered, {n.name: () for n in ordered}, {}
+        dropped.add(stuck)
+
+
+# ---------------------------------------------------------------------------
+# Emission context
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class _Val:
+    """What a node's generated expression evaluates to.
+
+    ``expr`` is the expression itself; ``is_socket`` distinguishes Socket
+    values (interface refs, lifted operators, socket-method results) from
+    node objects (constructor/factory calls). ``socket_id`` pins the
+    expression to one specific output. ``outputs`` dissolves the node
+    entirely into per-output expressions (e.g. SeparateXYZ → ``vec.x``).
+    """
+
+    expr: Expr | None
+    is_socket: bool = False
+    socket_id: str | None = None
+    outputs: dict[str, Expr] | None = None
+
+    def require_expr(self) -> Expr:
+        if self.expr is None:  # pragma: no cover - dissolved vals bind earlier
+            raise CodegenError(
+                "Value was dissolved into per-output accessors and has no "
+                "single expression"
+            )
+        return self.expr
+
+
+@dataclass
+class EmitContext:
+    """State shared across node emission; also the API for custom emitters."""
+
+    node_tree: Any
+    links: list[_Link]
+    incoming: dict[str, list[_Link]]
+    outgoing: dict[str, list[_Link]]
+    var_map: dict[str, _Val] = field(default_factory=dict)
+    counter: dict[str, int] = field(default_factory=dict)
+    used_aliases: set[str] = field(default_factory=set)
+    pending_lines: list[str] = field(default_factory=list)
+    zones: dict[str, _ZoneState] = field(default_factory=dict)
+    collector: _GroupCollector | None = None
+
+    def input_link(self, node: Node, identifier: str) -> _Link | None:
+        """The effective link into ``node``'s socket ``identifier``, if any."""
+        for link in self.incoming.get(node.name, ()):
+            if link.to_socket.identifier == identifier:
+                return link
+        return None
+
+    def _resolve(self, link: _Link) -> _Val:
+        from_node, from_socket = link.from_node, link.from_socket
+        if from_node.bl_idname == "NodeGroupInput":
+            val = self.var_map.get(f"_iface_inputs_{from_socket.identifier}")
+            if val is None:
+                raise CodegenError(
+                    f"Group input socket '{from_socket.name}' has no interface "
+                    "variable — was the interface emitted?"
+                )
+            return val
+        val = self.var_map.get(from_node.name)
+        if val is None:
+            raise CodegenError(
+                f"Node '{from_node.name}' is referenced before any code was "
+                "generated for it"
+            )
+        return val
+
+    def upstream_expr(self, link: _Link, *, pipeline: bool = False) -> Expr:
+        """Expression referencing the source side of ``link``.
+
+        ``pipeline`` marks a ``>>`` statement source: the arrow already
+        implies the node's primary output, so a multi-output node stays a
+        bare reference there instead of forcing ``.o.<name>``."""
+        return _output_expr(
+            self._resolve(link),
+            link.from_node,
+            link.from_socket,
+            to_socket=link.to_socket,
+            pipeline=pipeline,
+        )
+
+    def socket_expr(self, link: _Link) -> Expr:
+        """Like :meth:`upstream_expr` but guaranteed to evaluate to a Socket.
+
+        Node-valued upstreams get an explicit ``.o.<name>`` accessor even for
+        their first output, so socket methods can be called on the result.
+        """
+        return _output_expr(
+            self._resolve(link), link.from_node, link.from_socket, force_socket=True
+        )
+
+    def promote_to_var(self, link: _Link, expr: Expr) -> Expr:
+        """Bind an upstream socket expression to a variable and return its Ref.
+
+        Used when an expression must be referenced more than once (e.g. the
+        vector feeding ``vec.x`` / ``vec.y``). The assignment is queued on
+        ``pending_lines`` and flushed before the consuming statement.
+        """
+        label = link.from_socket.name or _node_var_label(link.from_node)
+        var = _make_var(label, self.counter)
+        self.pending_lines.append(f"    {var} = {expr.render()}")
+        ref = Ref(var)
+        if link.from_node.bl_idname != "NodeGroupInput":
+            self.var_map[link.from_node.name] = _Val(
+                ref, is_socket=True, socket_id=link.from_socket.identifier
+            )
+        return ref
+
+    def input_expr(self, node: Node, socket: NodeSocket) -> Expr | None:
+        """Expression for an input socket: upstream reference or literal default."""
+        link = self.input_link(node, socket.identifier)
+        if link is not None:
+            return self.upstream_expr(link)
+        if hasattr(socket, "default_value"):
+            return Lit(socket.default_value)
+        return None
+
+    def constructor(self, node: Node, skip_input_id: str | None = None) -> Call:
+        """``alias.ClassName(...)`` call for a node.
+
+        Linked inputs become kwargs referencing upstream expressions, unlinked
+        non-default inputs become literal kwargs, and non-default keyword-only
+        properties are appended. When a factory classmethod covers the node's
+        non-default properties (``Math.square_root``, ``Compare.float.equal``,
+        …) it is used instead of the plain constructor. ``skip_input_id``
+        omits one input socket (used for the implicit ``>>`` chain input).
+        """
+        found = _find_cls(node.bl_idname)
+        if found is None:
+            raise CodegenError(
+                f"No nodebpy class is registered for '{node.bl_idname}' "
+                f"(node '{node.name}')"
+            )
+        alias, cls = found
+        self.used_aliases.add(alias)
+
+        by_socket: dict[str, list[tuple[int, Expr]]] = {}
+        multi_inputs: set[str] = set()
+        for link in self.incoming.get(node.name, ()):
+            if skip_input_id and link.to_socket.identifier == skip_input_id:
+                continue
+            name = _socket_param(cls, link.to_socket.identifier)
+            if getattr(link.to_socket, "is_multi_input", False):
+                multi_inputs.add(name)
+            by_socket.setdefault(name, []).append(
+                (link.sort_id, self.upstream_expr(link))
+            )
+        socket_kwargs: dict[str, Expr] = {}
+        for name, entries in by_socket.items():
+            if len(entries) == 1 and name not in multi_inputs:
+                socket_kwargs[name] = entries[0][1]
+            else:
+                # Links on a multi-input socket become a tuple in creation
+                # order (descending sort_id) so the rebuilt tree gets the same
+                # multi-input ordering — even a single link, since manual
+                # classes (JoinGeometry, MeshBoolean, …) expect an iterable.
+                entries.sort(key=lambda e: e[0], reverse=True)
+                socket_kwargs[name] = TupleExpr([e[1] for e in entries])
+
+        socket_kwargs.update(
+            self._literal_kwargs(node, cls, socket_kwargs, skip_input_id)
+        )
+        prop_values = {
+            name: value
+            for name, value in _non_default_props(node, cls).items()
+            if name not in socket_kwargs
+        }
+
+        factory_call = _factory_call(
+            f"{alias}.{cls.__name__}",
+            node,
+            cls,
+            prop_values,
+            socket_kwargs,
+            skip_input_id,
+        )
+        if factory_call is not None:
+            return factory_call
+
+        kwargs = dict(socket_kwargs)
+        for name, value in prop_values.items():
+            kwargs[name] = Lit(value)
+        return _constructor_call(f"{alias}.{cls.__name__}", cls, node, kwargs)
+
+    def _literal_kwargs(
+        self, node, cls: type, existing: dict, skip_input_id: str | None
+    ) -> dict[str, Expr]:
+        """Literal kwargs for unlinked sockets whose value differs from the default."""
+        try:
+            sig = _signature(cls.__init__)
+        except (TypeError, ValueError):
+            sig = None
+        positional = (
+            [
+                (n, p)
+                for n, p in sig.parameters.items()
+                if n != "self" and p.kind == inspect.Parameter.POSITIONAL_OR_KEYWORD
+            ]
+            if sig
+            else []
+        )
+
+        result: dict[str, Expr] = {}
+        blender_defaults: dict[str, object] | None = None
+        for i, socket in enumerate(node.inputs):
+            if socket.is_linked:
+                continue
+            if not socket.enabled:
+                # Disabled by the active mode/data_type — the value is stale
+                # and ignored by evaluation (length= on EVALUATED
+                # CurveToPoints).
+                continue
+            if skip_input_id and socket.identifier == skip_input_id:
+                continue
+            if not hasattr(socket, "default_value"):
+                continue
+            kwarg_name = _socket_param(cls, socket.identifier)
+            if kwarg_name in existing:
+                continue
+            try:
+                val = socket.default_value
+            except Exception:  # noqa: BLE001, S112
+                continue
+
+            default: object = inspect.Parameter.empty
+            if sig and kwarg_name in sig.parameters:
+                default = sig.parameters[kwarg_name].default
+            elif i < len(positional):
+                default = positional[i][1].default
+
+            if default is not inspect.Parameter.empty and default is not None:
+                if _eq(val, default):
+                    continue
+            else:
+                # Python default is None (optional socket param) — compare
+                # against Blender's actual default for a fresh node.
+                if blender_defaults is None:
+                    blender_defaults = _get_blender_socket_defaults(
+                        self.node_tree.bl_idname, node.bl_idname
+                    )
+                blender_default = blender_defaults.get(socket.identifier)
+                if blender_default is not None:
+                    if _eq(val, blender_default):
+                        continue
+                elif _is_zero(val):
+                    continue
+            result[kwarg_name] = Lit(val)
+        return result
+
+
+def _bare_resolves_elsewhere(from_node, from_socket, to_socket) -> bool:
+    """Whether a bare reference to ``from_node`` would link a *different* output
+    than ``from_socket``.
+
+    nodebpy resolves a bare node via ``_best_match``, which ranks the node's
+    outputs by their position in ``SOCKET_COMPATIBILITY[consumer_type]`` — *not*
+    by an exact type match. A compatible-but-different type can outrank the
+    linked output (e.g. for a float ``VALUE`` consumer, a ``VECTOR`` output
+    ranks above an ``INT`` one, so EdgeVertices' bare reference resolves to
+    "Position 1" instead of the linked "Vertex Index 1"). Simulate that exact
+    ranking and report when the winner isn't ``from_socket``."""
+    if to_socket is None:
+        return False
+    from ..types import SOCKET_COMPATIBILITY
+
+    compatible = SOCKET_COMPATIBILITY.get(to_socket.type, ())
+    # Consider every compatible output regardless of the *original* node's
+    # current visibility: the rebuilt node is fresh, so an output the author
+    # manually hid (e.g. ImageTexture's "Alpha") is visible again and would
+    # win best-match. ``__extend__`` (CUSTOM) is never in ``compatible``.
+    candidates = [s for s in from_node.outputs if s.type in compatible]
+    if not candidates:
+        return False
+    # _best_match sorts by compatibility index (stable → first socket on ties).
+    best = min(
+        range(len(candidates)),
+        key=lambda i: (compatible.index(candidates[i].type), i),
+    )
+    return candidates[best].identifier != from_socket.identifier
+
+
+def _needs_output_accessor(from_node, from_socket) -> bool:
+    """Whether a reference to ``from_socket`` must spell out ``.o.<name>``
+    even though it is the node's first output.
+
+    A node with several active outputs is referenced explicitly so no reader
+    has to know which one is the default — except a node's *sole* geometry
+    output: for a geometry consumer nothing else could be meant (Cube's Mesh
+    next to its UV Map), so the bare reference stays. Inactive sockets (the
+    dormant variants of enum-switched outputs) and ``__extend__`` virtual
+    sockets don't count — only what the reader sees in the editor."""
+    active = [
+        s
+        for s in from_node.outputs
+        if not getattr(s, "is_inactive", False) and "__extend__" not in s.identifier
+    ]
+    if len(active) <= 1:
+        return False
+    if from_socket.type == "GEOMETRY":
+        return sum(s.type == "GEOMETRY" for s in active) > 1
+    return True
+
+
+def _output_expr(
+    val: _Val,
+    from_node,
+    from_socket,
+    *,
+    to_socket=None,
+    force_socket: bool = False,
+    pipeline: bool = False,
+) -> Expr:
+    """Reference an output socket of an emitted value.
+
+    Single-output node-valued expressions are referenced bare (``math``);
+    a node with several active outputs gets an explicit ``.o.<name>``
+    accessor so no reader has to know which output is the default
+    (SeparateMatrix's nine components read uniformly) — except in
+    ``pipeline`` position, where ``>>`` already implies the primary output,
+    and per :func:`_needs_output_accessor`'s sole-geometry-output rule.
+    ``force_socket`` adds the accessor even to a single-output node.
+    Socket-valued expressions are returned as-is, after checking they
+    represent the requested output.
+
+    ``to_socket`` is the consumer-side socket of the link, used to detect the
+    case where a bare reference would resolve to a *different* output than the
+    one linked: when the linked output's type differs from the consumer's and a
+    better-typed output exists, best-match linking would pick the other one, so
+    the accessor is forced.
+    """
+    if val.outputs is not None:
+        expr = val.outputs.get(from_socket.identifier)
+        if expr is None:
+            raise CodegenError(
+                f"Output '{from_socket.name}' of node '{from_node.name}' has "
+                "no generated expression"
+            )
+        return expr
+    if val.expr is None:  # pragma: no cover - vals always carry one or the other
+        raise CodegenError(f"Node '{from_node.name}' has no generated expression")
+    if val.is_socket:
+        if val.socket_id is not None and val.socket_id != from_socket.identifier:
+            raise CodegenError(
+                f"Expression for node '{from_node.name}' evaluates to output "
+                f"'{val.socket_id}' but '{from_socket.identifier}' was requested"
+            )
+        return val.expr
+    if (
+        not force_socket
+        and from_node.outputs
+        and from_node.outputs[0].identifier == from_socket.identifier
+        and (pipeline or not _needs_output_accessor(from_node, from_socket))
+        and not _bare_resolves_elsewhere(from_node, from_socket, to_socket)
+    ):
+        return val.expr
+    # Duplicated output names are ambiguous on the accessor.
+    if sum(s.name == from_socket.name for s in from_node.outputs) > 1:
+        # A variable-items node's item-output identifier carries a
+        # creation-order counter the rebuilt node reassigns (e.g. a captured
+        # item named "Selection" colliding with CaptureAttribute's built-in
+        # "Selection" output), and a group node's identifiers come from its
+        # interface, which a rebuild reassigns too. The *output position*
+        # follows the item-collection/interface order, which round-trips, so
+        # reference it by index. Fixed-output nodes (Mix's four "Result"
+        # sockets) keep their stable identifier.
+        if (
+            from_node.bl_idname in _ITEMS_NODE_SPECS
+            or from_node.bl_idname in _TYPED_ITEMS_NODE_SPECS
+            or from_node.type == "GROUP"
+        ):
+            index = next(
+                i
+                for i, s in enumerate(from_node.outputs)
+                if s.identifier == from_socket.identifier
+            )
+            return Subscript(Attr(val.expr, "o"), Lit(index))
+        key = _normalize(from_socket.identifier)
+    else:
+        key = _normalize(from_socket.name)
+    # ``normalize_name`` already folds non-identifier characters to underscores
+    # and suffixes keywords (``"From"`` → ``from_``), so ``key`` is normally a
+    # safe attribute. This guards the residual cases (e.g. a bare ``"_"``) by
+    # falling back to the raw socket name via subscript, which the accessor
+    # resolves by name.
+    if not key.isidentifier() or keyword.iskeyword(key):
+        return Subscript(Attr(val.expr, "o"), Lit(from_socket.name))
+    return Attr(val.expr, f"o.{key}")
+
+
+def _is_stable(expr: Expr) -> bool:
+    """True when an expression can be rendered repeatedly without creating
+    new nodes (a variable reference or attribute access rooted in one)."""
+    if isinstance(expr, Ref):
+        return True
+    if isinstance(expr, Attr):
+        return _is_stable(expr.base)
+    return False
+
+
+_BASE_NODE_PROPS: set[str] | None = None
+
+
+def _base_node_props() -> set[str]:
+    """Property names every bpy node has (color, label, mute, …) — these can
+    collide with socket parameter names and are never constructor props."""
+    global _BASE_NODE_PROPS
+    if _BASE_NODE_PROPS is None:
+        try:
+            import bpy
+
+            _BASE_NODE_PROPS = set(bpy.types.Node.bl_rna.properties.keys())
+        except Exception:  # noqa: BLE001
+            _BASE_NODE_PROPS = set()
+    return _BASE_NODE_PROPS
+
+
+def _property_rna_name(cls: type, name: str, rna_props) -> str | None:
+    """The bpy property a constructor property-param controls, or ``None``.
+
+    Usually the param name *is* the property identifier (``data_type``). Some
+    classes expose a property under a different name to avoid colliding with a
+    same-named input socket — AxesToRotation's ``primary`` proxies the
+    ``primary_axis`` enum because ``primary_axis`` is already the Vector socket.
+    For those, follow the ``@property`` getter's ``return self.node.<attr>``.
+    """
+    if rna_props is not None and name in rna_props:
+        return name
+    attr = inspect.getattr_static(cls, name, None)
+    if not isinstance(attr, property) or attr.fget is None:
+        return None
+    try:
+        body = ast.parse(textwrap.dedent(inspect.getsource(attr.fget)))
+    except (OSError, TypeError, SyntaxError):
+        return None
+    for sub in ast.walk(body):
+        # return self.node.<attr>
+        if (
+            isinstance(sub, ast.Return)
+            and isinstance(sub.value, ast.Attribute)
+            and isinstance(sub.value.value, ast.Attribute)
+            and sub.value.value.attr == "node"
+            and isinstance(sub.value.value.value, ast.Name)
+            and sub.value.value.value.id == "self"
+        ):
+            rna = sub.value.attr
+            if rna_props is not None and rna in rna_props:
+                return rna
+    return None
+
+
+def _non_default_props(node, cls: type) -> dict[str, Any]:
+    """Constructor property values that differ from their defaults.
+
+    Covers keyword-only params and positional-or-keyword params that name a
+    node-specific bpy property (e.g. ``Compare(operation=..., data_type=...)``);
+    positional socket params never match — they are either absent from
+    ``bl_rna.properties`` or shadow a base-Node property like ``color``.
+    """
+    try:
+        sig = _signature(cls.__init__)
+    except (TypeError, ValueError):
+        return {}
+    rna_props = getattr(getattr(node, "bl_rna", None), "properties", None)
+    result: dict[str, Any] = {}
+    for name, param in sig.parameters.items():
+        if name == "self":
+            continue
+        if param.kind not in (
+            inspect.Parameter.POSITIONAL_OR_KEYWORD,
+            inspect.Parameter.KEYWORD_ONLY,
+        ):
+            continue
+        if param.default is inspect.Parameter.empty:
+            continue
+        # A param that names an input socket is a socket argument, not a
+        # property — even when its name happens to match a bpy property.
+        # AxesToRotation's ``primary_axis`` is the Vector socket; the enum of
+        # the same bpy name rides on the separate ``primary`` param instead.
+        if _input_socket_by_kwarg(node, cls, name) is not None:
+            continue
+        # A constructor param represents a node setting only if it (or the
+        # property it proxies) names an actual bpy property. This excludes
+        # nodebpy-only convenience params such as FloatCurve's ``items`` (curve
+        # points), whose ``getattr`` would otherwise resolve to the unrelated
+        # ``bpy_struct.items`` dict method.
+        rna_name = _property_rna_name(cls, name, rna_props)
+        if rna_name is None:
+            continue
+        if rna_name in _base_node_props():
+            continue
+        try:
+            current = getattr(node, rna_name)
+        except AttributeError:
+            continue
+        if rna_name == "is_active_output":
+            if current and _has_sibling_output(node):
+                result[name] = True
+            continue
+        if rna_name in _DERIVED_PROPS:
+            continue
+        if param.default is None:
+            # left to Blender unless passed, so compare with what Blender sets
+            # on a new node in this kind of tree (Noise Texture is 2D in the
+            # compositor and 3D elsewhere)
+            fresh = _fresh_property(node, rna_name)
+            if fresh is not _UNKNOWN and current == fresh:
+                continue
+            result[name] = current
+            continue
+        if current != param.default:
+            result[name] = current
+    return result
+
+
+_UNKNOWN = object()
+_FRESH_PROPERTIES: dict[tuple[str, str, str], object] = {}
+
+
+def _fresh_property(node, rna_name: str) -> object:
+    """``rna_name`` on a freshly added node of this type in this kind of tree."""
+    tree_idname = getattr(getattr(node, "id_data", None), "bl_idname", "")
+    key = (tree_idname, node.bl_idname, rna_name)
+    if key not in _FRESH_PROPERTIES:
+
+        def probe(probe_tree) -> object:
+            return getattr(probe_tree.nodes.new(node.bl_idname), rna_name)
+
+        _FRESH_PROPERTIES[key] = _with_probe_tree(tree_idname, probe, _UNKNOWN)
+    return _FRESH_PROPERTIES[key]
+
+
+# Properties RNA computes from the node's sockets rather than storing: Color
+# Balance's white points are its temperature and tint inputs, which are
+# exported as sockets already.
+_DERIVED_PROPS = frozenset({"input_whitepoint", "output_whitepoint"})
+
+
+def _has_sibling_output(node) -> bool:
+    """Whether the tree holds another output node of the same type.
+
+    Constructors leave ``is_active_output`` to Blender, which makes the first
+    output of each type active, so it only needs spelling out when there is a
+    choice. Setting it to True deactivates the others, so the active output is
+    rebuilt whatever order the nodes are created in.
+    """
+    tree = getattr(node, "id_data", None)
+    if tree is None:
+        return False
+    return any(
+        other.bl_idname == node.bl_idname and other != node for other in tree.nodes
+    )
+
+
+# ---------------------------------------------------------------------------
+# Factory reverse-mapping
+#
+# nodebpy classes carry factory shortcuts whose bodies are simple
+# ``return cls(operation="SQRT", value=value)`` calls — generated classmethods
+# (``Math.square_root``), factory-instance methods
+# (``StoreNamedAttribute.point.integer``), and nested-namespace staticmethods
+# (``Compare.float.less_than``). Parsing those bodies at runtime yields a
+# reverse table from node state to factory path, so generated code uses the
+# same idiomatic spellings users write — with no separate table to keep in
+# sync with the generator. Factories whose bodies are not statically analysable
+# (positional args, helper indirection, **kwargs) are simply skipped and the
+# node falls back to the plain constructor.
+# ---------------------------------------------------------------------------
+
+
+class _Factory(NamedTuple):
+    path: str  # dotted path on the class, e.g. "square_root" or "point.integer"
+    props: dict[str, Any]  # constant constructor kwargs the factory sets
+    socket_params: dict[str, str]  # normalized socket kwarg → factory param name
+    param_defaults: dict[str, Any]  # factory param name → default (sig order)
+    prop_params: dict[str, str]  # passed-through property → keyword-only param
+
+
+_FACTORY_CACHE: dict[type, list[_Factory]] = {}
+
+
+def _as_function(attr: Any):
+    if isinstance(attr, (classmethod, staticmethod)):
+        return attr.__func__
+    if inspect.isfunction(attr):
+        return attr
+    return None
+
+
+def _iter_factory_funcs(cls: type):
+    """Yield (dotted_path, function, owner_instance) factory candidates.
+
+    Walks the class's own methods plus one level of factory namespaces —
+    either nested classes or class-level instances of module-local classes
+    (whose methods may reference ``self._x`` constants).
+    """
+    for name, attr in vars(cls).items():
+        if name.startswith("_"):
+            continue
+        func = _as_function(attr)
+        if func is not None:
+            yield name, func, None
+            continue
+        owner = None
+        if inspect.isclass(attr) and attr.__module__ == cls.__module__:
+            nested = attr
+        elif (
+            not callable(attr)
+            and type(attr).__module__ == cls.__module__
+            and inspect.isclass(type(attr))
+        ):
+            nested = type(attr)
+            owner = attr
+        else:
+            continue
+        for sub_name, sub_attr in vars(nested).items():
+            if sub_name.startswith("_"):
+                continue
+            sub_func = _as_function(sub_attr)
+            if sub_func is not None:
+                yield f"{name}.{sub_name}", sub_func, owner
+
+
+def _parse_factory_func(
+    func, owner: Any, cls: type
+) -> tuple[dict[str, Any], dict[str, str]] | None:
+    """Extract (constant props, socket-param mapping) from a factory body.
+
+    Only bodies of the form ``return cls(key="CONST", socket=param, ...)``
+    qualify; anything else returns None.
+    """
+    try:
+        source = textwrap.dedent(inspect.getsource(func))
+        fn = ast.parse(source).body[0]
+    except (OSError, TypeError, SyntaxError, IndexError):
+        return None
+    if not isinstance(fn, ast.FunctionDef):
+        return None
+    returns = [s for s in ast.walk(fn) if isinstance(s, ast.Return)]
+    if len(returns) != 1 or not isinstance(returns[0].value, ast.Call):
+        return None
+    call = returns[0].value
+    if not (isinstance(call.func, ast.Name) and call.func.id in ("cls", cls.__name__)):
+        return None
+
+    props: dict[str, Any] = {}
+    socket_params: dict[str, str] = {}
+    if call.args:
+        # Positional socket forwarding — ``return cls(value, group_index,
+        # data_type="FLOAT")`` — maps each bare-name argument to the
+        # constructor parameter at that position.
+        try:
+            init_params = [
+                param
+                for param in _signature(cls.__init__).parameters.values()
+                if param.name != "self"
+                and param.kind
+                in (
+                    inspect.Parameter.POSITIONAL_ONLY,
+                    inspect.Parameter.POSITIONAL_OR_KEYWORD,
+                )
+            ]
+        except (TypeError, ValueError):
+            return None
+        if len(call.args) > len(init_params):
+            return None
+        for arg, param in zip(call.args, init_params):
+            if not isinstance(arg, ast.Name):
+                return None
+            socket_params[_normalize(param.name)] = arg.id
+    for kw in call.keywords:
+        if kw.arg is None:
+            return None  # **kwargs forwarding
+        value = kw.value
+        if isinstance(value, ast.Constant):
+            props[kw.arg] = value.value
+        elif isinstance(value, ast.Name):
+            socket_params[_normalize(kw.arg)] = value.id
+        elif (
+            isinstance(value, ast.Attribute)
+            and isinstance(value.value, ast.Name)
+            and value.value.id == "self"
+            and owner is not None
+            and hasattr(owner, value.attr)
+        ):
+            # e.g. domain=self._domain on a parameterised factory instance
+            props[kw.arg] = getattr(owner, value.attr)
+        else:
+            return None
+    if not props:
+        return None
+    return props, socket_params
+
+
+def _factory_param_defaults(func) -> dict[str, Any] | None:
+    try:
+        sig = _signature(func)
+    except (TypeError, ValueError):
+        return None
+    defaults: dict[str, Any] = {}
+    for name, param in sig.parameters.items():
+        if name in ("self", "cls"):
+            continue
+        if param.kind in (
+            inspect.Parameter.VAR_POSITIONAL,
+            inspect.Parameter.VAR_KEYWORD,
+        ):
+            return None
+        defaults[name] = param.default
+    return defaults
+
+
+def _class_factories(cls: type) -> list[_Factory]:
+    """All statically-analysable factory shortcuts on a node class, cached."""
+    cached = _FACTORY_CACHE.get(cls)
+    if cached is not None:
+        return cached
+    factories: list[_Factory] = []
+    for path, func, owner in _iter_factory_funcs(cls):
+        parsed = _parse_factory_func(func, owner, cls)
+        if parsed is None:
+            continue
+        defaults = _factory_param_defaults(func)
+        if defaults is None:
+            continue
+        props, socket_params = parsed
+        # Keyword-only parameters forward node properties (generated factories
+        # take ``*, normalize=..., noise_dimensions=...``), not sockets.
+        keyword_only = {
+            name
+            for name, param in _signature(func).parameters.items()
+            if param.kind is inspect.Parameter.KEYWORD_ONLY
+        }
+        prop_params = {
+            key: param for key, param in socket_params.items() if param in keyword_only
+        }
+        socket_params = {
+            key: param
+            for key, param in socket_params.items()
+            if param not in keyword_only
+        }
+        factories.append(_Factory(path, props, socket_params, defaults, prop_params))
+    _FACTORY_CACHE[cls] = factories
+    return factories
+
+
+def _socket_param(cls: type, identifier: str) -> str:
+    """The constructor parameter for input socket ``identifier``: its
+    normalized identifier, unless the class renamed it after the socket's
+    display name (Color Ramp's ``Fac`` is ``factor``)."""
+    param = _normalize(identifier)
+    renames = getattr(cls, "_renamed_params", {}).get("__init__", {})
+    return renames.get(param, param)
+
+
+def _input_socket_by_kwarg(node, cls: type, kwarg_name: str):
+    normalized = _normalize(kwarg_name)
+    for socket in node.inputs:
+        if _socket_param(cls, socket.identifier) == normalized:
+            return socket
+    return None
+
+
+def _factory_state_matches(node, cls: type, props: dict[str, Any]) -> bool:
+    """True if every constant the factory sets equals the node's current state."""
+    rna_props = getattr(getattr(node, "bl_rna", None), "properties", None)
+    for key, value in props.items():
+        if rna_props is not None and key in rna_props:
+            if getattr(node, key) != value:
+                return False
+            continue
+        # Not an rna property — may be a constant on an input socket (menu
+        # "type" sockets). Verify against the socket's default value.
+        socket = _input_socket_by_kwarg(node, cls, key)
+        if (
+            socket is None
+            or socket.is_linked
+            or not hasattr(socket, "default_value")
+            or not _eq(socket.default_value, value)
+        ):
+            return False
+    return True
+
+
+# Factory-baked properties that define a node's *type signature* rather than
+# an operation choice. A factory baking only these is preferred even when
+# every baked value sits at its default — the data type is load-bearing, so
+# ``NamedAttribute.float(name)`` or ``FieldMinAndMax.point.float()`` reads
+# better than a bare constructor that leaves the type implicit. Factories
+# baking behavioural props (``operation``, ``mode``, …) keep requiring a
+# non-default state, as before.
+_TYPE_FACTORY_PROPS = frozenset({"data_type", "domain", "input_type", "socket_type"})
+_DATA_TYPE_PROPS = frozenset({"data_type", "input_type", "socket_type"})
+
+
+def _factory_call(
+    func_prefix: str,
+    node,
+    cls: type,
+    prop_values: dict[str, Any],
+    socket_kwargs: dict[str, Expr],
+    skip_input_id: str | None,
+) -> Call | None:
+    """A factory-classmethod Call for the node, or None to use the constructor.
+
+    A factory is used only when it is fully faithful: it must cover every
+    non-default property, every socket kwarg must map to one of its
+    parameters, and unlinked sockets whose factory-parameter default differs
+    from the node's value get explicit literal kwargs.
+    """
+    skip_key = _socket_param(cls, skip_input_id) if skip_input_id else None
+    best: tuple[_Factory, dict[str, Expr], tuple[bool, int, int]] | None = None
+
+    for factory in _class_factories(cls):
+        if not _factory_state_matches(node, cls, factory.props):
+            continue
+        covered = {_normalize(key) for key in factory.props}
+        passed = {
+            key: value
+            for key, value in prop_values.items()
+            if key not in factory.props and _normalize(key) in factory.prop_params
+        }
+        if set(prop_values) - set(factory.props) - set(passed):
+            continue  # leftover props can't be passed to the factory
+        if not (
+            (factory.props and set(factory.props) <= _TYPE_FACTORY_PROPS)
+            or set(prop_values)
+            or covered & set(socket_kwargs)
+        ):
+            continue  # nothing gained over the plain constructor
+
+        call_kwargs: dict[str, Expr] = {
+            factory.prop_params[_normalize(key)]: Lit(value)
+            for key, value in passed.items()
+        }
+        for key, expr in socket_kwargs.items():
+            if key in covered:
+                continue  # constant already baked into the factory
+            param = factory.socket_params.get(key)
+            if param is None:
+                break  # socket not exposed by this factory's signature
+            call_kwargs[param] = expr
+        else:
+            # Unlinked sockets where the factory default differs from the
+            # node's actual value need explicit kwargs (e.g. epsilon).
+            faithful = True
+            for key, param in factory.socket_params.items():
+                if param in call_kwargs or key == skip_key:
+                    continue
+                default = factory.param_defaults.get(param, inspect.Parameter.empty)
+                if (
+                    default is inspect.Parameter.empty
+                    or default is None
+                    or isinstance(default, Default)
+                ):
+                    continue  # None / Default.* mean "leave the socket untouched"
+                socket = _input_socket_by_kwarg(node, cls, key)
+                if socket is None:
+                    faithful = False
+                    break
+                if socket.is_linked or not hasattr(socket, "default_value"):
+                    continue
+                if not _eq(socket.default_value, default):
+                    call_kwargs[param] = Lit(socket.default_value)
+            # Prefer a factory baking the data type (``GetBundleItem.float(...,
+            # structure_type="SINGLE")`` over ``GetBundleItem.single(...)``),
+            # then the most constants baked, then the fewest properties passed
+            # through (``DeleteGeometry.edge()`` over ``.all(domain="EDGE")``).
+            rank = (
+                bool(_DATA_TYPE_PROPS & set(factory.props)),
+                len(factory.props),
+                -len(passed),
+            )
+            if faithful and (best is None or rank > best[2]):
+                ordered = {
+                    param: call_kwargs[param]
+                    for param in factory.param_defaults
+                    if param in call_kwargs
+                }
+                best = (factory, ordered, rank)
+
+    if best is None:
+        return None
+    factory, call_kwargs, _ = best
+    # Leading consecutive parameters render positionally (g.Math.sine(x)),
+    # matching how factory shortcuts are written by hand.
+    args: list[Expr] = []
+    keyword_only = set(factory.prop_params.values())
+    for param in factory.param_defaults:
+        if param not in call_kwargs or param in keyword_only:
+            break
+        args.append(call_kwargs.pop(param))
+    return Call(f"{func_prefix}.{factory.path}", args=args, kwargs=call_kwargs)
+
+
+# ---------------------------------------------------------------------------
+# Socket-method reverse-mapping
+#
+# Many nodes are idiomatically written as methods on the socket feeding their
+# primary input: ``value.map_range(...)``, ``cond.switch.float(a, b)``,
+# ``field.point.at(i)``, ``vec.x``. Each spec names the receiver input, the
+# method path (templated on node properties like domain/data_type), the
+# output the method returns, and the parameter mapping. A spec applies only
+# when it is fully faithful: receiver linked with a matching socket type, all
+# other linked inputs covered by parameters, all outgoing links from the
+# returned output, and no uncovered non-default properties. This assumes the
+# tree is self-consistent (a node's data_type matches its linked input — true
+# for everything Blender lets you build).
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class SocketMethodSpec:
+    receiver: str  # input identifier whose source becomes the receiver
+    method: str  # template, e.g. "map_range", "{domain}.at", "switch.{input_type}"
+    output: str | None = None  # output identifier the method returns (None = first)
+    params: tuple[tuple[str, str], ...] = ()  # (input identifier, param name)
+    require: tuple[tuple[str, Any], ...] = ()  # props that must equal these values
+    consumed_props: tuple[str, ...] = ()  # props encoded in the method path/receiver
+    prop_kwargs: tuple[tuple[str, Any], ...] = ()  # prop → default; kwarg if differs
+    receiver_socket_type: str | None = None  # required from-socket type;
+    # "{data_type}" resolves via _DATA_TYPE_SOCKET so the method re-derives
+    # the same data_type from the receiver socket on round-trip.
+    require_sockets: tuple[tuple[str, str], ...] = ()  # unlinked input sockets
+    # (typically menus) that must hold these values — baked into the method.
+    always_args: int = 0  # leading params the method signature requires —
+    # emitted even when unlinked at the default value (skipping them would
+    # render a call with missing positional arguments).
+    max_positional: int | None = None  # cap on positionally-rendered params;
+    # params beyond it are keyword-only in the method signature (map_range's
+    # ``steps``) and must render as kwargs.
+    receiver_list_prop: str | None = None  # for list methods: the receiver must
+    # be a LIST whose element type matches this prop (``socket_type`` /
+    # ``data_type``), inverting _socket_dtype's VALUE↔FLOAT swap, so the rebuilt
+    # method re-derives the same prop from the receiver socket.
+    receiver_structure: str | None = None  # required inferred_structure_type of
+    # the from-socket (grid methods live on the ``*SocketGrid`` wrappers only, so
+    # the receiver must be a GRID, not a plain field of the same socket type).
+
+
+@dataclass(frozen=True)
+class DissolveSpec:
+    """A node replaced entirely by accessor attributes on its input.
+
+    ``vec.x`` / ``mat.translation`` / ``col.r`` — every output maps to an
+    attribute on the receiver expression; the node itself emits nothing.
+    """
+
+    receiver: str  # input identifier
+    outputs: tuple[tuple[str, str], ...]  # (output identifier, attribute)
+    require: tuple[tuple[str, Any], ...] = ()  # props that must equal these
+    consumed_props: tuple[str, ...] = ()  # props the accessor re-derives
+    receiver_socket_type: str | None = None  # required from-socket type;
+    # "{data_type}" resolves via _DATA_TYPE_SOCKET like SocketMethodSpec.
+    receiver_structure: str | None = None  # required inferred_structure_type
+    # of the from-socket (grids expose the accessors, plain fields don't)
+
+
+@dataclass(frozen=True)
+class TupleMethodSpec:
+    """A node authored as a socket method returning a NamedTuple of sockets.
+
+    ``s.find(x)`` → ``(first_found, count)``, ``mat.svd()`` → ``(u, s, v)``.
+    Every output maps to a NamedTuple attribute on the call result; when more
+    than one link consumes the node, the call is bound to a variable first so
+    re-rendering it cannot create duplicate nodes.
+    """
+
+    receiver: str  # input identifier whose source becomes the receiver
+    method: str
+    outputs: tuple[tuple[str, str], ...]  # (output identifier, tuple attr)
+    params: tuple[tuple[str, str], ...] = ()  # required params — always
+    # rendered positionally, linked or not
+    receiver_socket_type: str | None = None
+    require_sockets: tuple[tuple[str, str], ...] = ()  # as SocketMethodSpec
+
+
+_DOMAIN_ATTR = {
+    "POINT": "point",
+    "EDGE": "edge",
+    "FACE": "face",
+    "CORNER": "corner",
+    "CURVE": "spline",
+    "INSTANCE": "instance",
+    "LAYER": "layer",
+}
+
+_SWITCH_METHOD = {
+    "FLOAT": "float",
+    "INT": "integer",
+    "BOOLEAN": "boolean",
+    "VECTOR": "vector",
+    "RGBA": "color",
+    "ROTATION": "rotation",
+    "MATRIX": "matrix",
+    "STRING": "string",
+    "MENU": "menu",
+    "OBJECT": "object",
+    "IMAGE": "image",
+    "GEOMETRY": "geometry",
+    "COLLECTION": "collection",
+    "MATERIAL": "material",
+    "BUNDLE": "bundle",
+    "CLOSURE": "closure",
+    "FONT": "font",
+    "SOUND": "sound",
+}
+
+_DATA_TYPE_SOCKET = {
+    "FLOAT": "VALUE",
+    "INT": "INT",
+    "FLOAT_VECTOR": "VECTOR",
+    "BOOLEAN": "BOOLEAN",
+    "FLOAT_COLOR": "RGBA",
+    "QUATERNION": "ROTATION",
+    "FLOAT4X4": "MATRIX",
+    "TRANSFORM": "MATRIX",
+    "VECTOR": "VECTOR",  # GridInfo-style enums spell vectors "VECTOR"
+    # Hash Value-style enums use the socket type names
+    "RGBA": "RGBA",
+    "ROTATION": "ROTATION",
+    "MATRIX": "MATRIX",
+    "STRING": "STRING",
+}
+
+_FIELD_PROPS = ("domain", "data_type")
+_FIELD_STAT_PARAMS = (("Group Index", "group_index"),)
+_MAP_RANGE_PROP_KWARGS = (("clamp", True), ("interpolation_type", "LINEAR"))
+
+
+def _field_spec(method: str, output: str, *params) -> SocketMethodSpec:
+    return SocketMethodSpec(
+        receiver="Value",
+        method=method,
+        output=output,
+        params=tuple(params),
+        consumed_props=_FIELD_PROPS,
+        receiver_socket_type="{data_type}",
+    )
+
+
+def _vector_op_spec(
+    operation: str, method: str, output: str, *params, always_args: int = 0
+) -> SocketMethodSpec:
+    return SocketMethodSpec(
+        receiver="Vector",
+        method=method,
+        output=output,
+        params=tuple(params),
+        require=(("operation", operation),),
+        consumed_props=("operation",),
+        receiver_socket_type="VECTOR",
+        always_args=always_args,
+    )
+
+
+def _string_spec(
+    method: str,
+    output: str,
+    *params,
+    case: str | None = None,
+    always_args: int = 0,
+) -> SocketMethodSpec:
+    return SocketMethodSpec(
+        receiver="String",
+        method=method,
+        output=output,
+        params=tuple(params),
+        require_sockets=(("Case", case),) if case else (),
+        receiver_socket_type="STRING",
+        always_args=always_args,
+    )
+
+
+def _match_string_spec(method: str, operation: str) -> SocketMethodSpec:
+    return SocketMethodSpec(
+        receiver="String",
+        method=method,
+        output="Result",
+        params=(("Key", "search"),),
+        require_sockets=(("Operation", operation),),
+        receiver_socket_type="STRING",
+        # ``search`` is a required parameter — a match against the empty
+        # string is never worth a silent default.
+        always_args=1,
+    )
+
+
+def _matrix_spec(method: str, output: str) -> SocketMethodSpec:
+    return SocketMethodSpec(
+        receiver="Matrix",
+        method=method,
+        output=output,
+        receiver_socket_type="MATRIX",
+    )
+
+
+def _math_unary_spec(
+    operation: str, method: str, *args: str, always_args: int = 0
+) -> SocketMethodSpec:
+    """A unary ``ShaderNodeMath`` op rendered as a float socket method —
+    ``value.sqrt()`` / ``value.sign()``. ``receiver_socket_type="VALUE"`` keeps
+    the round-trip faithful: the method only re-derives a float Math node when
+    the receiver is itself a float socket."""
+    return SocketMethodSpec(
+        receiver="Value",
+        method=method,
+        output="Value",
+        params=tuple((f"Value_{i + 1:03d}", arg) for i, arg in enumerate(args)),
+        require=(("operation", operation),),
+        consumed_props=("operation",),
+        receiver_socket_type="VALUE",
+        always_args=always_args,
+    )
+
+
+def _int_math_unary_spec(
+    operation: str, method: str, *args: str, always_args: int = 0
+) -> SocketMethodSpec:
+    """A unary ``FunctionNodeIntegerMath`` op rendered as an integer socket
+    method — ``value.sign()``. ``ABSOLUTE``/``NEGATE`` stay as the ``abs(x)`` /
+    ``-x`` lifts and so are deliberately absent here."""
+    return SocketMethodSpec(
+        receiver="Value",
+        method=method,
+        output="Value",
+        params=tuple((f"Value_{i + 1:03d}", arg) for i, arg in enumerate(args)),
+        require=(("operation", operation),),
+        consumed_props=("operation",),
+        receiver_socket_type="INT",
+        always_args=always_args,
+    )
+
+
+def _list_spec(
+    method: str,
+    output: str,
+    *params: tuple[str, str],
+    type_prop: str = "socket_type",
+    always_args: int = 0,
+) -> SocketMethodSpec:
+    """A list socket method — ``lst.list_length()`` / ``lst.filter(sel)`` /
+    ``lst.sort(weight)``. The element-type prop (``socket_type`` /
+    ``data_type``) is re-derived from the receiver list, so it is consumed and
+    gated by ``receiver_list_prop`` rather than emitted as a kwarg."""
+    return SocketMethodSpec(
+        receiver="List",
+        method=method,
+        output=output,
+        params=tuple(params),
+        consumed_props=(type_prop,),
+        receiver_list_prop=type_prop,
+        always_args=always_args,
+    )
+
+
+def _mix_spec(data_type: str, attr: str, suffix: str) -> SocketMethodSpec:
+    """``factor.mix.float(a, b)`` — the receiver is always the uniform float
+    factor; non-uniform vector mixes have ``Factor_Vector`` linked instead
+    and fall through to the constructor."""
+    return SocketMethodSpec(
+        receiver="Factor_Float",
+        method=f"mix.{attr}",
+        output=f"Result_{suffix}",
+        params=((f"A_{suffix}", "a"), (f"B_{suffix}", "b")),
+        require=(("data_type", data_type),),
+        consumed_props=("data_type",),
+        receiver_socket_type="VALUE",
+        always_args=2,
+    )
+
+
+def _grid_spec(
+    method: str,
+    output: str,
+    *params: tuple[str, str],
+    receiver_socket_type: str = "{data_type}",
+    data_type: bool = True,
+    always_args: int = 0,
+) -> SocketMethodSpec:
+    """A grid socket method — ``grid.mean()`` / ``grid.gradient()`` /
+    ``grid.sample(pos)``. The receiver must be a GRID-structured socket (the
+    methods live only on the ``*SocketGrid`` wrappers). Data-type-carrying grid
+    nodes re-derive ``data_type`` from the receiver's element type, so it is
+    consumed and gated by ``receiver_socket_type="{data_type}"`` rather than
+    emitted; the scalar/vector-only nodes pin a fixed ``VALUE`` / ``VECTOR``."""
+    return SocketMethodSpec(
+        receiver="Grid",
+        method=method,
+        output=output,
+        params=tuple(params),
+        consumed_props=("data_type",) if data_type else (),
+        receiver_socket_type=receiver_socket_type,
+        receiver_structure="GRID",
+        always_args=always_args,
+    )
+
+
+_SOCKET_METHODS: dict[str, list[SocketMethodSpec]] = {
+    "GeometryNodeSwitch": [
+        SocketMethodSpec(
+            receiver="Switch",
+            method="switch.{input_type}",
+            output="Output",
+            params=(("False", "false"), ("True", "true")),
+            consumed_props=("input_type",),
+            receiver_socket_type="BOOLEAN",
+        ),
+    ],
+    "ShaderNodeMapRange": [
+        SocketMethodSpec(
+            receiver="Value",
+            method="map_range",
+            output="Result",
+            params=(
+                ("From Min", "from_min"),
+                ("From Max", "from_max"),
+                ("To Min", "to_min"),
+                ("To Max", "to_max"),
+                ("Steps", "steps"),
+            ),
+            require=(("data_type", "FLOAT"),),
+            consumed_props=("data_type",),
+            prop_kwargs=_MAP_RANGE_PROP_KWARGS,
+            receiver_socket_type="VALUE",
+            max_positional=4,  # ``steps`` is keyword-only
+        ),
+        SocketMethodSpec(
+            receiver="Vector",
+            method="map_range",
+            output="Vector",
+            params=(
+                ("From_Min_FLOAT3", "from_min"),
+                ("From_Max_FLOAT3", "from_max"),
+                ("To_Min_FLOAT3", "to_min"),
+                ("To_Max_FLOAT3", "to_max"),
+                ("Steps_FLOAT3", "steps"),
+            ),
+            require=(("data_type", "FLOAT_VECTOR"),),
+            consumed_props=("data_type",),
+            prop_kwargs=_MAP_RANGE_PROP_KWARGS,
+            receiver_socket_type="VECTOR",
+            max_positional=4,  # ``steps`` is keyword-only
+        ),
+    ],
+    "GeometryNodeFieldAtIndex": [
+        _field_spec("{domain}.at", "Value", ("Index", "index")),
+    ],
+    "GeometryNodeFieldOnDomain": [
+        _field_spec("{domain}.evaluate", "Value"),
+    ],
+    "GeometryNodeAccumulateField": [
+        _field_spec("{domain}.leading", "Leading", *_FIELD_STAT_PARAMS),
+        _field_spec("{domain}.trailing", "Trailing", *_FIELD_STAT_PARAMS),
+        _field_spec("{domain}.total", "Total", *_FIELD_STAT_PARAMS),
+    ],
+    "GeometryNodeFieldAverage": [
+        _field_spec("{domain}.mean", "Mean", *_FIELD_STAT_PARAMS),
+        _field_spec("{domain}.median", "Median", *_FIELD_STAT_PARAMS),
+    ],
+    "GeometryNodeFieldMinAndMax": [
+        _field_spec("{domain}.min", "Min", *_FIELD_STAT_PARAMS),
+        _field_spec("{domain}.max", "Max", *_FIELD_STAT_PARAMS),
+    ],
+    "GeometryNodeFieldVariance": [
+        _field_spec("{domain}.std_dev", "Standard Deviation", *_FIELD_STAT_PARAMS),
+        _field_spec("{domain}.variance", "Variance", *_FIELD_STAT_PARAMS),
+    ],
+    "ShaderNodeVectorMath": [
+        _vector_op_spec("DOT_PRODUCT", "dot", "Value", ("Vector_001", "vector")),
+        _vector_op_spec("LENGTH", "length", "Value"),
+        _vector_op_spec("NORMALIZE", "normalize", "Vector"),
+        _vector_op_spec("CROSS_PRODUCT", "cross", "Vector", ("Vector_001", "other")),
+        _vector_op_spec("DISTANCE", "distance", "Value", ("Vector_001", "other")),
+        _vector_op_spec("PROJECT", "project", "Vector", ("Vector_001", "other")),
+        _vector_op_spec("REFLECT", "reflect", "Vector", ("Vector_001", "normal")),
+        _vector_op_spec(
+            "MULTIPLY_ADD",
+            "mul_add",
+            "Vector",
+            ("Vector_001", "multiplier"),
+            ("Vector_002", "addend"),
+            always_args=2,
+        ),
+        *(
+            _vector_op_spec(op, method, "Vector")
+            for op, method in (
+                ("FLOOR", "floor"),
+                ("CEIL", "ceil"),
+                ("ROUND", "round"),
+                ("FRACTION", "fraction"),
+                ("SIGN", "sign"),
+                ("SINE", "sin"),
+                ("COSINE", "cos"),
+                ("TANGENT", "tan"),
+            )
+        ),
+        _vector_op_spec(
+            "MINIMUM", "min", "Vector", ("Vector_001", "value"), always_args=1
+        ),
+        _vector_op_spec(
+            "MAXIMUM", "max", "Vector", ("Vector_001", "value"), always_args=1
+        ),
+        _vector_op_spec(
+            "SNAP", "snap", "Vector", ("Vector_001", "increment"), always_args=1
+        ),
+        # wrap()'s node sockets are swapped relative to the signature
+        _vector_op_spec(
+            "WRAP",
+            "wrap",
+            "Vector",
+            ("Vector_002", "min"),
+            ("Vector_001", "max"),
+            always_args=2,
+        ),
+        _vector_op_spec(
+            "FACEFORWARD",
+            "faceforward",
+            "Vector",
+            ("Vector_001", "incident"),
+            ("Vector_002", "reference"),
+            always_args=2,
+        ),
+        _vector_op_spec(
+            "REFRACT",
+            "refract",
+            "Vector",
+            ("Vector_001", "normal"),
+            ("Scale", "ior"),
+            always_args=2,
+        ),
+    ],
+    "FunctionNodeRotateVector": [
+        SocketMethodSpec(
+            receiver="Vector",
+            method="rotate",
+            output="Vector",
+            params=(("Rotation", "rotation"),),
+            receiver_socket_type="VECTOR",
+            # The operand is a required parameter (an identity rotate is
+            # never worth a silent default), so it always renders.
+            always_args=1,
+        ),
+    ],
+    "FunctionNodeTransformPoint": [
+        SocketMethodSpec(
+            receiver="Vector",
+            method="transform",
+            output="Vector",
+            params=(("Transform", "matrix"),),
+            receiver_socket_type="VECTOR",
+            always_args=1,
+        ),
+    ],
+    "ShaderNodeMath": [
+        _math_unary_spec(*args)
+        for args in [
+            ("SINE", "sin"),
+            ("COSINE", "cos"),
+            ("TANGENT", "tan"),
+            ("ARCSINE", "asin"),
+            ("ARCCOSINE", "acos"),
+            ("ARCTANGENT", "atan"),
+            ("HYPERBOLIC_SINE", "sinh"),
+            ("HYPERBOLIC_COSINE", "cosh"),
+            ("HYPERBOLIC_TANGENT", "tanh"),
+            ("EXPONENTIAL", "exp"),
+            ("TRUNC", "truncate"),
+            ("FRACT", "fraction"),
+            # ("ABSOLUTE", "abs"), # should isntead be handled by stdlib `abs(int)`
+            ("SQRT", "sqrt"),
+            ("FLOOR", "floor"),
+            ("CEIL", "ceil"),
+            ("ROUND", "round"),
+            ("RADIANS", "to_radians"),
+            ("DEGREES", "to_degrees"),
+            ("SIGN", "sign"),
+            ("MULTIPLY_ADD", "mul_add", "multiplier", "addend"),
+            ("PINGPONG", "ping_pong", "value"),
+            ("LOGARITHM", "log", "base"),
+            ("ARCTAN2", "atan2", "value"),
+            ("INVERSE_SQRT", "inverse_sqrt"),
+        ]
+    ]
+    + [
+        _math_unary_spec(op, method, "value", "distance", always_args=2)
+        for op, method in (("SMOOTH_MIN", "smooth_min"), ("SMOOTH_MAX", "smooth_max"))
+    ]
+    + [
+        _math_unary_spec(op, method, "value", always_args=1)
+        for op, method in (("MINIMUM", "min"), ("MAXIMUM", "max"))
+    ]
+    # No float modulo lift: the float mixin's modulo() builds FLOORED_MODULO,
+    # which the % operator lift already covers, and plain MODULO has no
+    # faithful method equivalent so it stays a factory call.
+    + [
+        # wrap()'s node sockets are swapped relative to the signature: the
+        # node's Value_001 is Max, Value_002 is Min.
+        SocketMethodSpec(
+            receiver="Value",
+            method="wrap",
+            output="Value",
+            params=(("Value_002", "min"), ("Value_001", "max")),
+            require=(("operation", "WRAP"),),
+            consumed_props=("operation",),
+            receiver_socket_type="VALUE",
+        ),
+    ],
+    "FunctionNodeIntegerMath": [
+        _int_math_unary_spec(*args)
+        for args in (
+            ("SIGN", "sign"),
+            # ("ABSOLUTE", "abs"),
+            ("MULTIPLY_ADD", "mul_add", "multiplier", "addend"),
+        )
+    ]
+    + [
+        _int_math_unary_spec(op, method, *args, always_args=1)
+        for op, method, *args in (
+            # No MODULO lift, as for float: modulo() builds FLOORED_MODULO,
+            # which the % operator lift covers.
+            ("MINIMUM", "min", "value"),
+            ("MAXIMUM", "max", "value"),
+            ("DIVIDE_ROUND", "divide_round", "divisor"),
+            ("DIVIDE_CEIL", "divide_ceiling", "divisor"),
+            ("GCD", "gcd", "value"),
+            ("LCM", "lcm", "value"),
+        )
+    ],
+    "GeometryNodeListLength": [
+        _list_spec("list_length", "Length", type_prop="data_type"),
+    ],
+    "GeometryNodeFilterList": [
+        _list_spec("filter", "Selection", ("Selection", "selection")),
+    ],
+    "GeometryNodeSortList": [
+        _list_spec(
+            "sort",
+            "List",
+            ("Sort Weight", "sort_weight"),
+            ("Group ID", "group_id"),
+            ("Selection", "selection"),
+            always_args=1,
+        ),
+    ],
+    "ShaderNodeClamp": [
+        SocketMethodSpec(
+            receiver="Value",
+            method="clamp",
+            output="Result",
+            params=(("Min", "min"), ("Max", "max")),
+            require=(("clamp_type", "MINMAX"),),
+            consumed_props=("clamp_type",),
+            receiver_socket_type="VALUE",
+        ),
+    ],
+    "FunctionNodeSliceString": [
+        _string_spec("slice", "String", ("Position", "position"), ("Length", "length")),
+    ],
+    "FunctionNodeReplaceString": [
+        _string_spec(
+            "replace",
+            "String",
+            ("Find", "find"),
+            ("Replace", "replace"),
+            always_args=2,
+        ),
+    ],
+    "FunctionNodeReverseString": [
+        _string_spec("reverse", "String"),
+    ],
+    "FunctionNodeStringLength": [
+        _string_spec("length", "Length"),
+    ],
+    "FunctionNodeMatchString": [
+        _match_string_spec("starts_with", "Starts With"),
+        _match_string_spec("ends_with", "Ends With"),
+        _match_string_spec("contains", "Contains"),
+    ],
+    "FunctionNodeSetStringCase": [
+        _string_spec("uppercase", "String", case="Uppercase"),
+        _string_spec("lowercase", "String", case="Lowercase"),
+    ],
+    "FunctionNodeTrimString": [
+        _string_spec(
+            "trim",
+            "String",
+            ("Characters", "characters"),
+            ("Whitespace", "whitespace"),
+            ("Start", "start"),
+            ("End", "end"),
+        ),
+    ],
+    "FunctionNodeSplitString": [
+        _string_spec("split", "List", ("Separator", "separator")),
+    ],
+    "FunctionNodeStringToValue": [
+        SocketMethodSpec(
+            receiver="String",
+            method="to_float",
+            output="Value",
+            require=(("data_type", "FLOAT"),),
+            consumed_props=("data_type",),
+            receiver_socket_type="STRING",
+        ),
+        SocketMethodSpec(
+            receiver="String",
+            method="to_integer",
+            output="Value",
+            params=(("Base", "base"),),
+            require=(("data_type", "INT"),),
+            consumed_props=("data_type",),
+            receiver_socket_type="STRING",
+        ),
+    ],
+    "FunctionNodeValueToString": [
+        SocketMethodSpec(
+            receiver="Value",
+            method="to_string",
+            output="String",
+            params=(("Decimals", "decimals"),),
+            require=(("data_type", "FLOAT"),),
+            consumed_props=("data_type",),
+            receiver_socket_type="VALUE",
+        ),
+        SocketMethodSpec(
+            receiver="Value",
+            method="to_string",
+            output="String",
+            params=(("Base", "base"), ("Padding", "padding")),
+            require=(("data_type", "INT"),),
+            consumed_props=("data_type",),
+            receiver_socket_type="INT",
+        ),
+    ],
+    "FunctionNodeInvertMatrix": [
+        _matrix_spec("invert", "Matrix"),
+    ],
+    "FunctionNodeTransposeMatrix": [
+        _matrix_spec("transpose", "Matrix"),
+    ],
+    "FunctionNodeMatrixDeterminant": [
+        _matrix_spec("determinant", "Determinant"),
+    ],
+    "FunctionNodeTransformDirection": [
+        SocketMethodSpec(
+            receiver="Direction",
+            method="transform_direction",
+            output="Direction",
+            params=(("Transform", "matrix"),),
+            receiver_socket_type="VECTOR",
+            always_args=1,
+        ),
+    ],
+    "FunctionNodeInvertRotation": [
+        SocketMethodSpec(
+            receiver="Rotation",
+            method="invert",
+            output="Rotation",
+            receiver_socket_type="ROTATION",
+        ),
+    ],
+    "FunctionNodeRotateRotation": [
+        SocketMethodSpec(
+            receiver="Rotation",
+            method="rotate",
+            output="Rotation",
+            params=(("Rotate By", "rotation"),),
+            prop_kwargs=(("rotation_space", "GLOBAL"),),
+            receiver_socket_type="ROTATION",
+            always_args=1,
+        ),
+    ],
+    "FunctionNodeRotationToEuler": [
+        SocketMethodSpec(
+            receiver="Rotation",
+            method="to_euler",
+            output="Euler",
+            receiver_socket_type="ROTATION",
+        ),
+    ],
+    "FunctionNodeBitMath": [
+        SocketMethodSpec(
+            receiver="A",
+            method=method,
+            output="Value",
+            params=(("Shift", "amount"),),
+            require=(("operation", operation),),
+            consumed_props=("operation",),
+            receiver_socket_type="INT",
+            always_args=1,
+        )
+        for operation, method in (("SHIFT", "shift"), ("ROTATE", "rotate"))
+    ],
+    "FunctionNodeProjectPoint": [
+        SocketMethodSpec(
+            receiver="Vector",
+            method="project_point",
+            output="Vector",
+            params=(("Transform", "matrix"),),
+            receiver_socket_type="VECTOR",
+            always_args=1,
+        ),
+    ],
+    "FunctionNodeEulerToRotation": [
+        SocketMethodSpec(
+            receiver="Euler",
+            method="euler_to_rotation",
+            output="Rotation",
+            receiver_socket_type="VECTOR",
+        ),
+    ],
+    "NodeImplicitConversion": [
+        SocketMethodSpec(
+            receiver="Value",
+            method="to_float",
+            output="Value",
+            require=(("data_type", "FLOAT"),),
+            consumed_props=("data_type",),
+            receiver_socket_type="INT",
+        ),
+    ],
+    "ShaderNodeGamma": [
+        SocketMethodSpec(
+            receiver="Color",
+            method="gamma",
+            output="Color",
+            params=(("Gamma", "gamma"),),
+            receiver_socket_type="RGBA",
+            always_args=1,
+        ),
+    ],
+    "FunctionNodeHashValue": [
+        SocketMethodSpec(
+            receiver="Value",
+            method="hash",
+            output="Hash",
+            params=(("Seed", "seed"),),
+            consumed_props=("data_type",),
+            receiver_socket_type="{data_type}",
+        ),
+    ],
+    "GeometryNodeBlurAttribute": [
+        SocketMethodSpec(
+            receiver="Value",
+            method="blur",
+            output="Value",
+            params=(("Iterations", "iterations"), ("Weight", "weight")),
+            consumed_props=("data_type",),
+            receiver_socket_type="{data_type}",
+        ),
+    ],
+    "GeometryNodeMaterialSelection": [
+        SocketMethodSpec(
+            receiver="Material",
+            method="selection",
+            output="Selection",
+            receiver_socket_type="MATERIAL",
+        ),
+    ],
+    "GeometryNodeGetGeometryBundle": [
+        SocketMethodSpec(
+            receiver="Geometry",
+            method="bundle",
+            output="Bundle",
+            receiver_socket_type="GEOMETRY",
+        ),
+    ],
+    "GeometryNodeSetGeometryBundle": [
+        SocketMethodSpec(
+            receiver="Geometry",
+            method="set_bundle",
+            output="Geometry",
+            params=(("Bundle", "bundle"),),
+            receiver_socket_type="GEOMETRY",
+            always_args=1,
+        ),
+    ],
+    "NodeGetBundleItem": [
+        SocketMethodSpec(
+            receiver="Bundle",
+            method="get.{socket_type}",
+            output="Item",
+            params=(("Path", "path"),),
+            consumed_props=("socket_type",),
+            receiver_socket_type="BUNDLE",
+            always_args=1,
+        ),
+        # has() builds the node with the default FLOAT socket type
+        SocketMethodSpec(
+            receiver="Bundle",
+            method="has",
+            output="Exists",
+            params=(("Path", "path"),),
+            require=(("socket_type", "FLOAT"),),
+            receiver_socket_type="BUNDLE",
+            always_args=1,
+        ),
+    ],
+    "NodeGetNestedBundlePaths": [
+        SocketMethodSpec(
+            receiver="Bundle",
+            method="paths",
+            output="Paths",
+            params=(
+                ("Mode", "mode"),
+                ("Pattern Mode", "pattern_mode"),
+                ("Bundle Type", "bundle_type"),
+                ("Data Type", "data_type"),
+            ),
+            receiver_socket_type="BUNDLE",
+        ),
+    ],
+    "ShaderNodeMix": [
+        _mix_spec("FLOAT", "float", "Float"),
+        _mix_spec("VECTOR", "vector", "Vector"),
+        _mix_spec("RGBA", "color", "Color"),
+        _mix_spec("ROTATION", "rotation", "Rotation"),
+    ],
+    # Grid socket methods — numeric grids (Float / Integer / Vector) -------
+    "GeometryNodeSetGridBackground": [
+        _grid_spec(
+            "set_background",
+            "Grid",
+            ("Background", "background"),
+            ("Update Inactive", "update_inactive"),
+            always_args=1,
+        ),
+    ],
+    "GeometryNodeSetGridTransform": [
+        _grid_spec("set_transform", "Grid", ("Transform", "matrix"), always_args=1),
+    ],
+    "GeometryNodeGridAdvect": [
+        _grid_spec(
+            "advect",
+            "Grid",
+            ("Velocity", "velocity"),
+            ("Time Step", "time_step"),
+            ("Integration Scheme", "integration_scheme"),
+            ("Limiter", "limiter"),
+            always_args=1,
+        ),
+    ],
+    "GeometryNodeGridMean": [
+        _grid_spec("mean", "Grid", ("Width", "width"), ("Iterations", "iterations")),
+    ],
+    "GeometryNodeGridMedian": [
+        _grid_spec("median", "Grid", ("Width", "width"), ("Iterations", "iterations")),
+    ],
+    # Float-grid operators -------------------------------------------------
+    "GeometryNodeGridGradient": [
+        _grid_spec(
+            "gradient", "Gradient", receiver_socket_type="VALUE", data_type=False
+        ),
+    ],
+    "GeometryNodeGridLaplacian": [
+        _grid_spec(
+            "laplacian", "Laplacian", receiver_socket_type="VALUE", data_type=False
+        ),
+    ],
+    "GeometryNodeSDFGridFillet": [
+        _grid_spec(
+            "sdf_fillet",
+            "Grid",
+            ("Iterations", "iterations"),
+            receiver_socket_type="VALUE",
+            data_type=False,
+        ),
+    ],
+    "GeometryNodeSDFGridLaplacian": [
+        _grid_spec(
+            "sdf_laplacian",
+            "Grid",
+            ("Iterations", "iterations"),
+            receiver_socket_type="VALUE",
+            data_type=False,
+        ),
+    ],
+    "GeometryNodeSDFGridMean": [
+        _grid_spec(
+            "sdf_mean",
+            "Grid",
+            ("Width", "width"),
+            ("Iterations", "iterations"),
+            receiver_socket_type="VALUE",
+            data_type=False,
+        ),
+    ],
+    "GeometryNodeSDFGridMeanCurvature": [
+        _grid_spec(
+            "sdf_mean_curvature",
+            "Grid",
+            ("Iterations", "iterations"),
+            receiver_socket_type="VALUE",
+            data_type=False,
+        ),
+    ],
+    "GeometryNodeSDFGridMedian": [
+        _grid_spec(
+            "sdf_median",
+            "Grid",
+            ("Width", "width"),
+            ("Iterations", "iterations"),
+            receiver_socket_type="VALUE",
+            data_type=False,
+        ),
+    ],
+    "GeometryNodeSDFGridOffset": [
+        _grid_spec(
+            "sdf_offset",
+            "Grid",
+            ("Distance", "distance"),
+            receiver_socket_type="VALUE",
+            data_type=False,
+        ),
+    ],
+    "GeometryNodeGridToMesh": [
+        _grid_spec(
+            "to_mesh",
+            "Mesh",
+            ("Threshold", "threshold"),
+            ("Adaptivity", "adaptivity"),
+            receiver_socket_type="VALUE",
+            data_type=False,
+        ),
+    ],
+    # Vector-grid operators ------------------------------------------------
+    "GeometryNodeGridCurl": [
+        _grid_spec("curl", "Curl", receiver_socket_type="VECTOR", data_type=False),
+    ],
+    "GeometryNodeGridDivergence": [
+        _grid_spec(
+            "divergence", "Divergence", receiver_socket_type="VECTOR", data_type=False
+        ),
+    ],
+    # Methods on every grid type ------------------------------------------
+    "GeometryNodeSampleGrid": [
+        _grid_spec(
+            "sample",
+            "Value",
+            ("Position", "position"),
+            ("Interpolation", "interpolation"),
+        ),
+    ],
+    "GeometryNodeSampleGridIndex": [
+        _grid_spec("sample_index", "Value", ("X", "x"), ("Y", "y"), ("Z", "z")),
+    ],
+    "GeometryNodeGridClip": [
+        _grid_spec(
+            "clip",
+            "Grid",
+            ("Min X", "min_x"),
+            ("Min Y", "min_y"),
+            ("Min Z", "min_z"),
+            ("Max X", "max_x"),
+            ("Max Y", "max_y"),
+            ("Max Z", "max_z"),
+        ),
+    ],
+    "GeometryNodeGridDilateAndErode": [
+        _grid_spec(
+            "dilate_erode",
+            "Grid",
+            ("Steps", "steps"),
+            ("Connectivity", "connectivity"),
+            ("Tiles", "tiles"),
+        ),
+    ],
+    "GeometryNodeGridPrune": [
+        _grid_spec(
+            "prune", "Grid", ("Threshold", "threshold"), ("Mode", "mode"), always_args=1
+        ),
+    ],
+    "GeometryNodeGridVoxelize": [
+        _grid_spec("voxelize", "Grid"),
+    ],
+}
+
+_DISSOLVE_SPECS: dict[str, DissolveSpec] = {
+    "ShaderNodeSeparateXYZ": DissolveSpec(
+        receiver="Vector",
+        outputs=(("X", "x"), ("Y", "y"), ("Z", "z")),
+        receiver_socket_type="VECTOR",
+    ),
+    "FunctionNodeSeparateTransform": DissolveSpec(
+        receiver="Transform",
+        outputs=(
+            ("Translation", "translation"),
+            ("Rotation", "rotation"),
+            ("Scale", "scale"),
+        ),
+        receiver_socket_type="MATRIX",
+    ),
+    "FunctionNodeSeparateColor": DissolveSpec(
+        receiver="Color",
+        outputs=(("Red", "r"), ("Green", "g"), ("Blue", "b"), ("Alpha", "a")),
+        require=(("mode", "RGB"),),
+        receiver_socket_type="RGBA",
+    ),
+    # Repeated accessor renders are safe: GridSocketMixin._info reuses one
+    # GridInfo node per grid socket.
+    "GeometryNodeGridInfo": DissolveSpec(
+        receiver="Grid",
+        outputs=(("Transform", "transform"), ("Background Value", "background_value")),
+        consumed_props=("data_type",),
+        receiver_socket_type="{data_type}",
+        receiver_structure="GRID",
+    ),
+}
+
+_TUPLE_METHODS: dict[str, TupleMethodSpec] = {
+    "FunctionNodeFindInString": TupleMethodSpec(
+        receiver="String",
+        method="find",
+        outputs=(("First Found", "first_found"), ("Count", "count")),
+        params=(("Search", "search"),),
+        receiver_socket_type="STRING",
+        require_sockets=(("Mode", "From Start"),),
+    ),
+    "FunctionNodeMatrixSVD": TupleMethodSpec(
+        receiver="Matrix",
+        method="svd",
+        outputs=(("U", "u"), ("S", "s"), ("V", "v")),
+        receiver_socket_type="MATRIX",
+    ),
+    "FunctionNodeRotationToQuaternion": TupleMethodSpec(
+        receiver="Rotation",
+        method="to_quaternion",
+        outputs=(("W", "w"), ("X", "x"), ("Y", "y"), ("Z", "z")),
+        receiver_socket_type="ROTATION",
+    ),
+    "GeometryNodeCollectionChildren": TupleMethodSpec(
+        receiver="Collection",
+        method="children",
+        outputs=(("Collections", "collections"), ("Objects", "objects")),
+        params=(("Recursive", "recursive"),),
+        receiver_socket_type="COLLECTION",
+    ),
+    "FunctionNodeRotationToAxisAngle": TupleMethodSpec(
+        receiver="Rotation",
+        method="to_axis_angle",
+        outputs=(("Axis", "axis"), ("Angle", "angle")),
+        receiver_socket_type="ROTATION",
+    ),
+}
+
+
+def _format_method(spec: SocketMethodSpec, node) -> str | None:
+    method = spec.method
+    if "{domain}" in method:
+        attr = _DOMAIN_ATTR.get(getattr(node, "domain", ""))
+        if attr is None:
+            return None
+        method = method.replace("{domain}", attr)
+    if "{input_type}" in method:
+        attr = _SWITCH_METHOD.get(getattr(node, "input_type", ""))
+        if attr is None:
+            return None
+        method = method.replace("{input_type}", attr)
+    if "{socket_type}" in method:
+        attr = _SWITCH_METHOD.get(getattr(node, "socket_type", ""))
+        if attr is None:
+            return None
+        method = method.replace("{socket_type}", attr)
+    return method
+
+
+def _input_socket_by_identifier(node, identifier: str):
+    for socket in node.inputs:
+        if socket.identifier == identifier:
+            return socket
+    return None
+
+
+def _list_receiver_ok(node, link, type_prop: str) -> bool:
+    """Whether ``link`` feeds a list method faithfully: the source must be a
+    LIST whose element type matches ``node``'s ``socket_type`` / ``data_type``.
+
+    The builder sets that prop from ``_socket_dtype`` (``VALUE`` → ``FLOAT``,
+    else unchanged), so the rebuilt method re-derives the same prop only when
+    the receiver element type inverts back to it."""
+    if getattr(link.from_socket, "inferred_structure_type", None) != "LIST":
+        return False
+    prop = getattr(node, type_prop, None)
+    return prop is not None and prop.replace("FLOAT", "VALUE") == link.from_socket.type
+
+
+def _receiver_reproduces_structure(ctx: EmitContext, link, structure: str) -> bool:
+    """Whether ``link``'s source carries ``structure`` (GRID) both in the
+    authored tree and on a fresh rebuild of the source node.
+
+    The authored socket must already report the structure, and a freshly
+    created node of the same type must reproduce it on the same output — see
+    :func:`_fresh_output_structure` for why the rebuild check is needed."""
+    if getattr(link.from_socket, "inferred_structure_type", None) != structure:
+        return False
+    return (
+        _fresh_output_structure(
+            ctx.node_tree.bl_idname,
+            link.from_node.bl_idname,
+            link.from_socket.identifier,
+        )
+        == structure
+    )
+
+
+def _match_socket_method(
+    ctx: EmitContext, node
+) -> tuple[SocketMethodSpec, str, str] | None:
+    """Structural check: (spec, method path, output identifier) or None."""
+    specs = _SOCKET_METHODS.get(node.bl_idname)
+    if not specs:
+        return None
+    found = _find_cls(node.bl_idname)
+    if found is None:
+        return None
+    incoming = {
+        link.to_socket.identifier: link for link in ctx.incoming.get(node.name, ())
+    }
+    for spec in specs:
+        if any(getattr(node, key, None) != value for key, value in spec.require):
+            continue
+        receiver_link = incoming.get(spec.receiver)
+        if receiver_link is None:
+            continue
+        expected_type = spec.receiver_socket_type
+        if expected_type == "{data_type}":
+            expected_type = _DATA_TYPE_SOCKET.get(getattr(node, "data_type", ""))
+            if expected_type is None:
+                continue
+        if (
+            expected_type is not None
+            and receiver_link.from_socket.type != expected_type
+        ):
+            continue
+        if spec.receiver_structure is not None and not _receiver_reproduces_structure(
+            ctx, receiver_link, spec.receiver_structure
+        ):
+            continue
+        if spec.receiver_list_prop is not None and not _list_receiver_ok(
+            node, receiver_link, spec.receiver_list_prop
+        ):
+            continue
+        if not all(
+            (socket := _input_socket_by_identifier(node, identifier)) is not None
+            and not socket.is_linked
+            and hasattr(socket, "default_value")
+            and _eq(socket.default_value, value)
+            for identifier, value in spec.require_sockets
+        ):
+            continue
+        method = _format_method(spec, node)
+        if method is None:
+            continue
+        out_id = spec.output or (node.outputs[0].identifier if node.outputs else "")
+        if any(
+            link.from_socket.identifier != out_id
+            for link in ctx.outgoing.get(node.name, ())
+        ):
+            continue
+        param_ids = {pid for pid, _ in spec.params}
+        if set(incoming) - {spec.receiver} - param_ids:
+            continue
+        _, cls = found
+        uncovered = (
+            set(_non_default_props(node, cls))
+            - set(spec.consumed_props)
+            - {key for key, _ in spec.require}
+            - {key for key, _ in spec.prop_kwargs}
+        )
+        if uncovered:
+            continue
+        # An unlinked input the call can't express must sit at its default,
+        # or the method would silently drop the authored value (e.g. Vector
+        # Rotate's Axis) — bail to the constructor path instead.
+        spec_ids = param_ids | {spec.receiver} | {i for i, _ in spec.require_sockets}
+        fresh_defaults = _get_blender_socket_defaults(
+            node.id_data.bl_idname, node.bl_idname
+        )
+        if any(
+            socket.identifier not in spec_ids
+            and socket.identifier not in incoming
+            and socket.enabled
+            and hasattr(socket, "default_value")
+            and (fresh := fresh_defaults.get(socket.identifier)) is not None
+            and not _eq(socket.default_value, fresh)
+            for socket in node.inputs
+        ):
+            continue
+        return spec, method, out_id
+    return None
+
+
+def _method_defaults(receiver: NodeSocket, method: str) -> dict[str, Any]:
+    """The defaults of the method the receiver's socket class has under the
+    name *method*, by parameter. A ``None`` default leaves the socket as it
+    is, so it is left out, as are methods reached through an accessor
+    (``point.at``)."""
+    from ..builder._registry import _wrap_socket
+
+    cls = type(_wrap_socket(receiver))
+    function = None if "." in method else getattr(cls, method, None)
+    if not callable(function):
+        return {}
+    return {
+        name: parameter.default
+        for name, parameter in inspect.signature(function).parameters.items()
+        if parameter.default not in (inspect.Parameter.empty, None)
+    }
+
+
+def _socket_method_val(ctx: EmitContext, node) -> _Val | None:
+    """Emit a node as a method call on its receiver socket, if possible."""
+    dissolve = _DISSOLVE_SPECS.get(node.bl_idname)
+    if dissolve is not None:
+        return _dissolve_val(ctx, node, dissolve)
+    tuple_spec = _TUPLE_METHODS.get(node.bl_idname)
+    if tuple_spec is not None:
+        return _tuple_method_val(ctx, node, tuple_spec)
+    matched = _match_socket_method(ctx, node)
+    if matched is None:
+        return None
+    spec, method, out_id = matched
+    incoming = {
+        link.to_socket.identifier: link for link in ctx.incoming.get(node.name, ())
+    }
+    receiver = ctx.socket_expr(incoming[spec.receiver])
+    # An argument left out takes the method's default, which need not be
+    # the node's (log() is natural where Blender's base is 0.5).
+    method_defaults = _method_defaults(incoming[spec.receiver].from_socket, method)
+
+    kwargs: dict[str, Expr] = {}
+    blender_defaults: dict[str, object] | None = None
+    for index, (identifier, param) in enumerate(spec.params):
+        link = incoming.get(identifier)
+        if link is not None:
+            kwargs[param] = ctx.upstream_expr(link)
+            continue
+        socket = _input_socket_by_identifier(node, identifier)
+        if socket is None or not hasattr(socket, "default_value"):
+            continue  # pragma: no cover - spec params name real sockets
+        value = socket.default_value
+        if index >= spec.always_args and method_defaults.get(param) is not None:
+            if not _eq(value, method_defaults[param]):
+                kwargs[param] = Lit(value)
+            continue
+        if index >= spec.always_args:
+            if blender_defaults is None:
+                blender_defaults = _get_blender_socket_defaults(
+                    ctx.node_tree.bl_idname, node.bl_idname
+                )
+            default = blender_defaults.get(identifier)
+            if default is not None:
+                if _eq(value, default):
+                    continue
+            elif _is_zero(value):
+                continue
+        kwargs[param] = Lit(value)
+
+    for prop, default in spec.prop_kwargs:
+        current = getattr(node, prop)
+        if current != default:
+            kwargs[prop] = Lit(current)
+
+    # Leading consecutive parameters render positionally (capped where the
+    # signature makes trailing params keyword-only).
+    args: list[Expr] = []
+    for _, param in spec.params:
+        if param not in kwargs:
+            break
+        if spec.max_positional is not None and len(args) >= spec.max_positional:
+            break
+        args.append(kwargs.pop(param))
+
+    return _Val(
+        MethodCall(receiver, method, args=args, kwargs=kwargs),
+        is_socket=True,
+        socket_id=out_id,
+    )
+
+
+def _dissolve_val(ctx: EmitContext, node, spec: DissolveSpec) -> _Val | None:
+    """Dissolve a separator node into accessor attributes on its input
+    (``vec.x``, ``mat.translation``, ``col.r``).
+
+    Repeated accessor renders are safe: the library's
+    ``_find_or_create_linked`` reuses one separator node per source socket.
+    The receiver must be a variable (or be promoted to one) when it would
+    render more than once, so no upstream nodes get duplicated.
+    """
+    if any(getattr(node, key, None) != value for key, value in spec.require):
+        return None
+    links = ctx.incoming.get(node.name, ())
+    if len(links) != 1 or links[0].to_socket.identifier != spec.receiver:
+        return None
+    # ``_find_or_create_linked`` reuses one separator per (source socket, node
+    # type), so dissolving several separators that share a source socket would
+    # collapse them into a single rebuilt node. When the source feeds more than
+    # one separator of this type, keep them all as explicit constructor calls so
+    # the node count round-trips.
+    source = links[0].from_socket
+    siblings = sum(
+        1
+        for out in ctx.outgoing.get(links[0].from_node.name, ())
+        if out.from_socket.identifier == source.identifier
+        and out.to_node.bl_idname == node.bl_idname
+        and out.to_socket.identifier == spec.receiver
+    )
+    if siblings > 1:
+        return None
+    expected_type = spec.receiver_socket_type
+    if expected_type == "{data_type}":
+        expected_type = _DATA_TYPE_SOCKET.get(getattr(node, "data_type", ""))
+        if expected_type is None:
+            return None
+    if expected_type is not None and links[0].from_socket.type != expected_type:
+        return None
+    if spec.receiver_structure is not None and not _receiver_reproduces_structure(
+        ctx, links[0], spec.receiver_structure
+    ):
+        return None
+    found = _find_cls(node.bl_idname)
+    if found is not None:
+        uncovered = (
+            set(_non_default_props(node, found[1]))
+            - {key for key, _ in spec.require}
+            - set(spec.consumed_props)
+        )
+        if uncovered:
+            return None
+    out_links = ctx.outgoing.get(node.name, ())
+    receiver = ctx.socket_expr(links[0])
+    if len(out_links) > 1 and not _is_stable(receiver):
+        receiver = ctx.promote_to_var(links[0], receiver)
+    return _Val(
+        None,
+        outputs={ident: Attr(receiver, attr) for ident, attr in spec.outputs},
+    )
+
+
+def _tuple_method_val(ctx: EmitContext, node, spec: TupleMethodSpec) -> _Val | None:
+    """Dissolve a node into NamedTuple attributes on a socket-method call
+    (``s.find(x).count``, ``mat.svd().u``)."""
+    incoming = {
+        link.to_socket.identifier: link for link in ctx.incoming.get(node.name, ())
+    }
+    receiver_link = incoming.get(spec.receiver)
+    if receiver_link is None:
+        return None
+    if (
+        spec.receiver_socket_type is not None
+        and receiver_link.from_socket.type != spec.receiver_socket_type
+    ):
+        return None
+    if not all(
+        (socket := _input_socket_by_identifier(node, identifier)) is not None
+        and not socket.is_linked
+        and hasattr(socket, "default_value")
+        and _eq(socket.default_value, value)
+        for identifier, value in spec.require_sockets
+    ):
+        return None
+    param_ids = {pid for pid, _ in spec.params}
+    if set(incoming) - {spec.receiver} - param_ids:
+        return None
+    found = _find_cls(node.bl_idname)
+    if found is None or _non_default_props(node, found[1]):
+        return None
+    out_links = ctx.outgoing.get(node.name, ())
+    if not out_links:
+        return None  # unused node — the constructor keeps it visible
+
+    args: list[Expr] = []
+    for identifier, _param in spec.params:
+        link = incoming.get(identifier)
+        if link is not None:
+            args.append(ctx.upstream_expr(link))
+            continue
+        socket = _input_socket_by_identifier(node, identifier)
+        if socket is None or not hasattr(socket, "default_value"):
+            return None
+        args.append(Lit(socket.default_value))
+
+    base: Expr = MethodCall(ctx.socket_expr(receiver_link), spec.method, args)
+    if len(out_links) > 1:
+        # Bind the NamedTuple once — re-rendering the call would create a
+        # new node per consumer.
+        var = _make_var(node.bl_label or "result", ctx.counter)
+        ctx.pending_lines.append(f"    {var} = {base.render()}")
+        base = Ref(var)
+    return _Val(
+        None,
+        outputs={ident: Attr(base, attr) for ident, attr in spec.outputs},
+    )
+
+
+# ---------------------------------------------------------------------------
+# Custom emitters
+# ---------------------------------------------------------------------------
+
+EmitterFn = Callable[[Any, EmitContext], "Expr | _Val | None"]
+
+_EMITTERS: dict[str, EmitterFn] = {}
+
+
+def register_emitter(bl_idname: str) -> Callable[[EmitterFn], EmitterFn]:
+    """Register a custom code emitter for a node type.
+
+    The decorated function is called as ``fn(node, ctx)`` and returns an
+    :class:`Expr` for the node (or ``None`` to fall back to the default
+    emission). ``ctx`` is an :class:`EmitContext`; useful helpers are
+    ``ctx.input_expr(node, socket)``, ``ctx.upstream_expr(link)`` and
+    ``ctx.constructor(node)``. Emitters may also return a :class:`_Val`
+    with per-output expressions (and queue statements on
+    ``ctx.pending_lines``) to dissolve a node entirely, as the zone
+    emitters do.
+
+    Example::
+
+        @register_emitter("GeometryNodeSetShadeSmooth")
+        def _emit_shade_smooth(node, ctx):
+            if node.domain == "FACE":
+                return Call("g.SetShadeSmooth.face")
+            return None
+    """
+
+    def decorator(fn: EmitterFn) -> EmitterFn:
+        _EMITTERS[bl_idname] = fn
+        return fn
+
+    return decorator
+
+
+# ---------------------------------------------------------------------------
+# Operator lifting
+#
+# These tables mirror nodebpy's OperatorMixin exactly: an emitted operator
+# expression must rebuild the same node and operation on round-trip.
+# ---------------------------------------------------------------------------
+
+_LIFT_BINARY: dict[str, dict[str, str]] = {
+    "ShaderNodeMath": {
+        "ADD": "+",
+        "SUBTRACT": "-",
+        "MULTIPLY": "*",
+        "DIVIDE": "/",
+        "POWER": "**",
+        # float % dispatches to FLOORED_MODULO (Python semantics); plain
+        # MODULO has no operator equivalent and stays a call.
+        "FLOORED_MODULO": "%",
+    },
+    "ShaderNodeVectorMath": {
+        "ADD": "+",
+        "SUBTRACT": "-",
+        "MULTIPLY": "*",
+        "DIVIDE": "/",
+        "MODULO": "%",
+        "SCALE": "*",
+    },
+    "FunctionNodeIntegerMath": {
+        "ADD": "+",
+        "SUBTRACT": "-",
+        "MULTIPLY": "*",
+        # no DIVIDE: integer / builds a float Math DIVIDE
+        "POWER": "**",
+        # integer % dispatches to FLOORED_MODULO, as float % does
+        "FLOORED_MODULO": "%",
+        "DIVIDE_FLOOR": "//",
+    },
+    "FunctionNodeBooleanMath": {
+        "AND": "&",
+        "OR": "|",
+        "XOR": "^",
+    },
+    "FunctionNodeBitMath": {
+        "AND": "&",
+        "OR": "|",
+        "XOR": "^",
+    },
+}
+
+_LIFT_UNARY: dict[str, dict[str, str]] = {
+    "FunctionNodeBooleanMath": {"NOT": "~"},
+    "FunctionNodeBitMath": {"NOT": "~"},
+    "FunctionNodeIntegerMath": {"NEGATE": "-"},
+}
+
+_LIFT_UNARY_CALL: dict[str, dict[str, str]] = {
+    "ShaderNodeMath": {"ABSOLUTE": "abs"},
+    "ShaderNodeVectorMath": {"ABSOLUTE": "abs"},
+    "FunctionNodeIntegerMath": {"ABSOLUTE": "abs"},
+}
+
+
+def _lift_pair(node) -> tuple[Any, Any] | None:
+    """The two operand sockets for a liftable binary node, or None."""
+    if (
+        node.bl_idname == "ShaderNodeVectorMath"
+        and getattr(node, "operation", "") == "SCALE"
+    ):
+        if len(node.inputs) > 3:
+            return node.inputs[0], node.inputs[3]
+        return None
+    if len(node.inputs) >= 2:
+        return node.inputs[0], node.inputs[1]
+    return None
+
+
+class _LiftPlan(NamedTuple):
+    kind: str  # "binary" | "unary" | "unary_call"
+    op: str
+    sockets: tuple
+
+
+def _linked_src_types(ctx: EmitContext, node) -> dict[str, str]:
+    """Input socket identifier → the type of the socket feeding it."""
+    return {
+        link.to_socket.identifier: link.from_socket.type
+        for link in ctx.incoming.get(node.name, ())
+    }
+
+
+def _operator_dispatch_ok(node, pair, linked_ids: set[str], src_types) -> bool:
+    """Whether re-evaluating the lifted operator re-creates *this* node type.
+
+    Python operator dispatch picks the node from the operand types, so a lift
+    is only faithful when the operands would dispatch back to the same node:
+
+    - VectorMath needs a linked **vector** operand (else ``tuple * scalar``
+      makes a scalar Math node).
+    - Math needs a **float** operand — a linked ``VALUE`` socket or an unlinked
+      input (whose default renders as a float literal); otherwise two integer
+      operands dispatch to IntegerMath instead. It also needs its *dispatching*
+      operand (the first linked one — the left of ``a op b``) to be a scalar:
+      a color/vector source there dispatches to VectorMath instead.
+    """
+    if src_types is None:
+        return True
+    if node.bl_idname == "ShaderNodeVectorMath":
+        if not any(src_types.get(s.identifier) == "VECTOR" for s in pair):
+            return False
+        # MULTIPLY and SCALE both lift to ``*`` but dispatch differently on the
+        # *second* operand (see _dispatch_vector_math): ``vec * x`` makes a SCALE
+        # node when ``x`` is a scalar (VALUE/INT) and a MULTIPLY node otherwise.
+        # Refuse the lift when the original operation wouldn't be reproduced.
+        operation = getattr(node, "operation", "")
+        if operation in ("SCALE", "MULTIPLY"):
+            second_type = src_types.get(pair[1].identifier)
+            second_is_scalar = second_type in ("VALUE", "INT")
+            if (
+                operation == "SCALE"
+                and second_type is not None
+                and not second_is_scalar
+            ):
+                return False
+            if operation == "MULTIPLY" and second_is_scalar:
+                return False
+        return True
+    if node.bl_idname == "ShaderNodeMath":
+        dispatcher = next(
+            (s.identifier for s in pair if s.identifier in linked_ids), None
+        )
+        if dispatcher is not None and src_types.get(dispatcher) in ("RGBA", "VECTOR"):
+            return False
+        # integer operands also make a Math node for ``/``
+        if getattr(node, "operation", "") == "DIVIDE":
+            return True
+        return any(
+            s.identifier not in linked_ids or src_types.get(s.identifier) == "VALUE"
+            for s in pair
+        )
+    if node.bl_idname == "FunctionNodeIntegerMath":
+        # ``a - b`` re-dispatches to IntegerMath only when every linked
+        # operand is an integer source (unlinked defaults render as int
+        # literals); a float operand rebuilds as a ShaderNodeMath instead.
+        return all(
+            s.identifier not in linked_ids or src_types.get(s.identifier) == "INT"
+            for s in pair
+        )
+    if node.bl_idname in ("FunctionNodeBooleanMath", "FunctionNodeBitMath"):
+        return _logic_dispatch_ok(node, pair, linked_ids, src_types)
+    return True
+
+
+def _logic_dispatch_ok(node, sockets, linked_ids: set[str], src_types) -> bool:
+    """``&``/``|``/``^``/``~`` build Bit Math when the dispatching operand (the
+    first linked one) is an integer and Boolean Math otherwise, so the lift is
+    faithful only when that operand's type picks this node."""
+    dispatcher = next(
+        (s.identifier for s in sockets if s.identifier in linked_ids), None
+    )
+    is_int = dispatcher is not None and src_types.get(dispatcher) == "INT"
+    return is_int == (node.bl_idname == "FunctionNodeBitMath")
+
+
+def _lift_plan(
+    node, linked_ids: set[str], src_types: dict[str, str] | None = None
+) -> _LiftPlan | None:
+    """Structural check: can this node be lifted to an operator expression?
+
+    Requires at least one linked operand and that *all* incoming links target
+    operand sockets — otherwise links would be silently dropped on round-trip.
+    """
+    # An operator expression can't carry the clamp flag; the constructor can.
+    if getattr(node, "use_clamp", False):
+        return None
+    operation = getattr(node, "operation", "")
+
+    binary = _LIFT_BINARY.get(node.bl_idname, {})
+    if operation in binary:
+        pair = _lift_pair(node)
+        if pair is not None:
+            lhs_s, rhs_s = pair
+            pair_ids = {lhs_s.identifier, rhs_s.identifier}
+            if (
+                linked_ids
+                and linked_ids <= pair_ids
+                and all(
+                    s.identifier in linked_ids or hasattr(s, "default_value")
+                    for s in pair
+                )
+            ):
+                if not _operator_dispatch_ok(node, pair, linked_ids, src_types):
+                    return None
+                return _LiftPlan("binary", binary[operation], pair)
+
+    inputs = list(node.inputs)
+    if inputs:
+        first_id = inputs[0].identifier
+        unary = _LIFT_UNARY.get(node.bl_idname, {})
+        if operation in unary and linked_ids == {first_id}:
+            if (
+                src_types is not None
+                and node.bl_idname in ("FunctionNodeBooleanMath", "FunctionNodeBitMath")
+                and not _logic_dispatch_ok(node, inputs[:1], linked_ids, src_types)
+            ):
+                return None
+            return _LiftPlan("unary", unary[operation], (inputs[0],))
+        unary_call = _LIFT_UNARY_CALL.get(node.bl_idname, {})
+        if operation in unary_call and linked_ids == {first_id}:
+            return _LiftPlan("unary_call", unary_call[operation], (inputs[0],))
+    return None
+
+
+def _lift_expr(ctx: EmitContext, node, plan: _LiftPlan) -> Expr:
+    """Materialise a lift plan into an expression.
+
+    The leading operand is forced to a socket (``.o.<name>``) when linked. A
+    Python operator dispatches on its left operand, and nodebpy's operators
+    return a socket only when the left operand is already a socket — e.g.
+    ``g.Compare…() & g.Compare…()`` (two *nodes*) returns a BooleanMath *node*,
+    so ``.switch`` on the lifted result would fail. Forcing only the left
+    operand keeps the result a socket with minimal noise (``socket * node`` is
+    already a socket); socket_expr is a no-op on operands that are already
+    sockets.
+    """
+    operands: list[Expr] = []
+    for index, socket in enumerate(plan.sockets):
+        link = ctx.input_link(node, socket.identifier)
+        if index == 0 and link is not None:
+            operand: Expr | None = ctx.socket_expr(link)
+        else:
+            operand = ctx.input_expr(node, socket)
+        if operand is None:  # pragma: no cover - guarded by _lift_plan
+            raise CodegenError(f"Cannot resolve operands for '{node.name}'")
+        operands.append(operand)
+    if plan.kind == "binary":
+        return BinOp(plan.op, operands[0], operands[1])
+    if plan.kind == "unary":
+        return UnaryOp(plan.op, operands[0])
+    return Call(plan.op, args=[operands[0]])
+
+
+def _linked_ids(ctx: EmitContext, node) -> set[str]:
+    return {link.to_socket.identifier for link in ctx.incoming.get(node.name, ())}
+
+
+# ---------------------------------------------------------------------------
+# Chain analysis (>> stitching)
+# ---------------------------------------------------------------------------
+
+_CHAIN_SOCKET_TYPES = frozenset({"GEOMETRY", "SHADER"})
+
+
+def _chainable_links(ctx: EmitContext) -> dict[str, _Link]:
+    """Consumer node name → its single chainable incoming link.
+
+    A link is chainable when it joins a first output to a first input, the
+    source socket has no fan-out, and the data flowing is a "pipeline" type
+    (geometry/shader). Such links render as ``a >> b``.
+    """
+    socket_out: dict[tuple[str, str], int] = {}
+    socket_in: dict[tuple[str, str], int] = {}
+    for link in ctx.links:
+        out_key = (link.from_node.name, link.from_socket.identifier)
+        in_key = (link.to_node.name, link.to_socket.identifier)
+        socket_out[out_key] = socket_out.get(out_key, 0) + 1
+        socket_in[in_key] = socket_in.get(in_key, 0) + 1
+
+    result: dict[str, _Link] = {}
+    for link in ctx.links:
+        from_node, to_node = link.from_node, link.to_node
+        if to_node.bl_idname in _SKIP_BL_IDNAMES:
+            continue
+        if to_node.bl_idname in _EMITTERS:
+            continue  # custom emitters manage their own inputs
+        if link.from_socket.type not in _CHAIN_SOCKET_TYPES:
+            continue
+        if from_node.bl_idname != "NodeGroupInput" and not (
+            from_node.outputs
+            and from_node.outputs[0].identifier == link.from_socket.identifier
+        ):
+            continue
+        if not (
+            to_node.inputs and to_node.inputs[0].identifier == link.to_socket.identifier
+        ):
+            continue
+        if socket_out[(from_node.name, link.from_socket.identifier)] != 1:
+            continue
+        # Multi-input sockets with several links must stay as a tuple kwarg.
+        if socket_in[(to_node.name, link.to_socket.identifier)] != 1:
+            continue
+        result[to_node.name] = link
+    return result
+
+
+def _gate_short_chains(
+    ctx: EmitContext,
+    chain_in: dict[str, _Link],
+    ordered: list,
+    min_chain_length: int,
+) -> set[str]:
+    """Suppress ``>>`` syntax for runs shorter than the threshold.
+
+    Run length counts a leading interface input and a trailing interface
+    output as items, matching how the chain reads in the generated code.
+    Returns the gated node names — they keep ordinary kwarg inlining but
+    render no ``>>`` — and removes their entries from ``chain_in``.
+    """
+    node_by_name = {n.name: n for n in ordered}
+    next_map: dict[str, str] = {}
+    head_from_iface: set[str] = set()
+    for to_name, link in chain_in.items():
+        if link.from_node.bl_idname == "NodeGroupInput":
+            head_from_iface.add(to_name)
+        else:
+            next_map[link.from_node.name] = to_name
+    chained_consumers = set(next_map.values())
+
+    forced: set[str] = set()
+    for node in ordered:
+        name = node.name
+        if name in chained_consumers:
+            continue  # not a run head
+        if node.bl_idname in _EMITTERS:
+            continue
+        if (
+            _lift_plan(node, _linked_ids(ctx, node), _linked_src_types(ctx, node))
+            is not None
+        ):
+            continue  # lifted expressions always inline freely
+        if node.bl_idname in _SOCKET_METHODS and _match_socket_method(ctx, node):
+            continue  # socket-method expressions inline freely too
+
+        run = [name]
+        current = name
+        while (
+            len(ctx.outgoing.get(current, ())) == 1
+            and (nxt := next_map.get(current))
+            and nxt not in run
+        ):
+            run.append(nxt)
+            current = nxt
+
+        tail_outs = ctx.outgoing.get(run[-1], ())
+        tail_to_iface = (
+            len(tail_outs) == 1 and tail_outs[0].to_node.bl_idname == "NodeGroupOutput"
+        )
+        length = (
+            len(run)
+            + (1 if run[0] in head_from_iface else 0)
+            + (1 if tail_to_iface else 0)
+        )
+        # Only gate runs that would actually render with >> syntax.
+        has_chain_syntax = len(run) > 1 or run[0] in head_from_iface or tail_to_iface
+        if has_chain_syntax and length < min_chain_length:
+            forced.update(n for n in run if node_by_name[n].bl_idname not in _EMITTERS)
+
+    for name in forced:
+        chain_in.pop(name, None)
+    return forced
+
+
+# ---------------------------------------------------------------------------
+# Interface codegen
+# ---------------------------------------------------------------------------
+
+
+# Builder parameter name → bpy interface property name, where they differ.
+_IFACE_PARAM_ATTR = {
+    "expanded": "menu_expanded",
+    "default_attribute": "default_attribute_name",
+}
+
+
+def _interface_kwargs(item, method: str) -> dict[str, Any]:
+    """Keyword args whose interface values differ from a fresh socket.
+
+    The builder method's keyword-only parameters define what is expressible;
+    each is compared against a probed fresh interface socket (covering
+    parameters like ``min_value`` whose Python default ``None`` means
+    "leave Blender's default alone").
+    """
+    from ..builder.tree import SocketContext
+
+    fn = getattr(SocketContext, method, None)
+    if fn is None:
+        return {}
+    try:
+        sig = _signature(fn)
+    except (TypeError, ValueError):
+        return {}
+    defaults = _get_interface_defaults(item.id_data.bl_idname, item.socket_type)
+    kwargs: dict[str, Any] = {}
+    for pname, param in sig.parameters.items():
+        if param.kind != inspect.Parameter.KEYWORD_ONLY:
+            continue
+        attr = _IFACE_PARAM_ATTR.get(pname, pname)
+        try:
+            current = getattr(item, attr)
+        except AttributeError:
+            continue
+        if not isinstance(current, str):
+            try:
+                current = tuple(current)
+            except TypeError:
+                pass
+        if attr in defaults:
+            if _eq(current, defaults[attr]):
+                continue
+        elif param.default is None or _eq(current, param.default):
+            continue
+        kwargs[pname] = current
+    return kwargs
+
+
+def _emit_interface(
+    item, direction: str, ctx: EmitContext, indent: str = "    "
+) -> str:
+    """One ``var = tree.inputs.*()`` / ``tree.outputs.*()`` line."""
+    method = _INTERFACE_TYPE_METHOD.get(item.socket_type, "geometry")
+    var_name = _make_var(item.name, ctx.counter)
+    # A socket no effective link touches (e.g. a panel-toggle input, or one
+    # only read through the modifier UI) still needs its declaration, but the
+    # variable is never referenced again — prefix it so the generated module
+    # passes lint (F841).
+    if direction == "inputs":
+        used = any(
+            link.from_node.bl_idname == "NodeGroupInput"
+            and link.from_socket.identifier == item.identifier
+            for link in ctx.links
+        )
+    else:
+        used = any(
+            link.to_node.bl_idname == "NodeGroupOutput"
+            and link.to_socket.identifier == item.identifier
+            for link in ctx.links
+        )
+    if not used:
+        var_name = "_" + var_name
+    ctx.var_map[f"_iface_{direction}_{item.identifier}"] = _Val(
+        Ref(var_name), is_socket=True
+    )
+
+    args: list[str] = [_fmt(item.name)]
+    # Datablock defaults (an Object/Collection/Image/Material) do have
+    # meaning on the interface and render as bpy.data lookups; the rest of
+    # _NO_DEFAULT_VALUE_TYPES genuinely has no default_value.
+    emits_default = (
+        item.socket_type not in _NO_DEFAULT_VALUE_TYPES
+        or item.socket_type in _DATABLOCK_IFACE_DEFAULT_TYPES
+    )
+    if emits_default:
+        try:
+            default = item.default_value
+        except (AttributeError, TypeError):
+            default = None
+        if direction == "outputs" and default is not None:
+            # Outputs rarely carry a meaningful default (a group constant the
+            # caller reads back is the exception), so only a value the rebuild
+            # wouldn't produce anyway is emitted — it must match both the
+            # fresh socket's default AND the factory parameter's (a colour
+            # socket starts (0,0,0,1) but the factory fills (1,1,1,1)) to be
+            # skipped. Inputs keep emitting theirs unconditionally, as before.
+            from ..builder.tree import SocketContext
+
+            fresh = _get_interface_defaults(item.id_data.bl_idname, item.socket_type)
+            param = _signature(getattr(SocketContext, method)).parameters.get(
+                "default_value"
+            )
+            factory_default = None if param is None else param.default
+            if (
+                "default_value" in fresh
+                and _eq(default, fresh["default_value"])
+                and (factory_default is None or _eq(default, factory_default))
+            ):
+                default = None
+        # A menu default is emitted inline: the builder defers applying it to
+        # context exit, once the MenuSwitch defining its enum items is linked.
+        # An empty one (no linked MenuSwitch) has nothing to restore.
+        if item.socket_type == "NodeSocketMenu" and not default:
+            default = None
+        if default is not None:
+            args.append(_fmt(default))
+    description = getattr(item, "description", "")
+    if description:
+        args.append(f"description={_fmt(description)}")
+    args.extend(
+        f"{pname}={_fmt(value)}"
+        for pname, value in _interface_kwargs(item, method).items()
+    )
+    return f"{indent}{var_name} = tree.{direction}.{method}({', '.join(args)})"
+
+
+def _panel_directions(panel) -> set[str]:
+    """The socket directions found anywhere under ``panel`` (recursively)."""
+    directions: set[str] = set()
+    for child in panel.interface_items:
+        if getattr(child, "item_type", "") == "SOCKET":
+            directions.add(child.in_out)
+        elif getattr(child, "item_type", "") == "PANEL":
+            directions |= _panel_directions(child)
+    return directions
+
+
+def _panel_chain(item) -> list:
+    """The panels enclosing ``item``, outermost first."""
+    chain = []
+    parent = item.parent
+    while parent is not None and parent.index != -1:
+        chain.append(parent)
+        parent = parent.parent
+    chain.reverse()
+    return chain
+
+
+def _emit_interface_lines(node_tree, ctx: EmitContext) -> list[str]:
+    """Interface lines in items_tree order, grouped into (possibly nested)
+    panel with-blocks. A panel whose sockets span both directions is opened
+    with ``tree.panel`` — once per direction pass, reusing the panel — and a
+    single-direction panel with ``tree.<direction>.panel``. Blender allows
+    same-named sibling panels, which a name-based reuse would fold into one
+    on rebuild: those are created with ``reuse=False`` and, when mixed,
+    bound to a variable the second direction pass reopens by handle."""
+    lines: list[str] = []
+
+    def _sibling_key(panel) -> tuple[str, int]:
+        parent = panel.parent
+        parent_ix = -1 if parent is None else parent.index
+        return (panel.name, parent_ix)
+
+    duplicate_keys = {
+        key
+        for key, count in Counter(
+            _sibling_key(item)
+            for item in node_tree.interface.items_tree
+            if getattr(item, "item_type", "") == "PANEL"
+        ).items()
+        if count > 1
+    }
+    handles: dict[int, str] = {}  # ambiguous mixed panel index → variable name
+    opened: set[int] = set()  # panel indices any pass has created
+
+    def _panel_open_args(panel) -> list[str]:
+        panel_args = [_fmt(panel.name)]
+        if panel.description:
+            panel_args.append(f"description={_fmt(panel.description)}")
+        if panel.default_closed:
+            panel_args.append("default_closed=True")
+        return panel_args
+
+    for direction, in_out in (("inputs", "INPUT"), ("outputs", "OUTPUT")):
+        open_stack: list[int] = []  # indices of the panels currently open
+        for item in node_tree.interface.items_tree:
+            if getattr(item, "item_type", "") != "SOCKET" or item.in_out != in_out:
+                continue
+            chain = _panel_chain(item)
+            keep = 0
+            while (
+                keep < min(len(open_stack), len(chain))
+                and open_stack[keep] == chain[keep].index
+            ):
+                keep += 1
+            del open_stack[keep:]
+            for panel in chain[keep:]:
+                indent = "    " * (1 + len(open_stack))
+                if panel.index in handles:
+                    # Second direction pass over an ambiguously-named mixed
+                    # panel: reopen exactly the panel the first pass created.
+                    lines.append(f"{indent}with tree.panel({handles[panel.index]}):")
+                    open_stack.append(panel.index)
+                    continue
+                panel_args = _panel_open_args(panel)
+                mixed = len(_panel_directions(panel)) > 1
+                ambiguous = _sibling_key(panel) in duplicate_keys
+                suffix = ""
+                if mixed and ambiguous:
+                    panel_args.append("reuse=False")
+                    var = f"_panel_{panel.index}"
+                    handles[panel.index] = var
+                    suffix = f" as {var}"
+                target = "tree" if mixed else f"tree.{direction}"
+                lines.append(
+                    f"{indent}with {target}.panel({', '.join(panel_args)}){suffix}:"
+                )
+                open_stack.append(panel.index)
+                opened.add(panel.index)
+            lines.append(
+                _emit_interface(
+                    item, direction, ctx, indent="    " * (1 + len(open_stack))
+                )
+            )
+
+    # Panels holding no sockets anywhere (an empty organizational stub) were
+    # never opened above — create them explicitly, nesting under their (by
+    # now existing) ancestors via reusing ``tree.panel`` blocks.
+    for panel in node_tree.interface.items_tree:
+        if getattr(panel, "item_type", "") != "PANEL" or panel.index in opened:
+            continue
+        depth = 1
+        for ancestor in _panel_chain(panel):
+            # items_tree lists parents before their children, so every
+            # ancestor was already created — by a socket pass or by this loop.
+            indent = "    " * depth
+            if ancestor.index in handles:  # pragma: no cover - ambiguous mixed
+                lines.append(f"{indent}with tree.panel({handles[ancestor.index]}):")
+            else:
+                lines.append(f"{indent}with tree.panel({_fmt(ancestor.name)}):")
+            depth += 1
+        args = [*_panel_open_args(panel), "reuse=False"]
+        lines.append(f"{'    ' * depth}with tree.panel({', '.join(args)}):")
+        lines.append(f"{'    ' * (depth + 1)}pass")
+        opened.add(panel.index)
+    return lines
+
+
+# ---------------------------------------------------------------------------
+# Main entry point
+# ---------------------------------------------------------------------------
+
+
+def _format_with_ruff(code: str) -> str:
+    """Run ``code`` through ``ruff check --fix-only`` and ``ruff format`` if
+    the optional ``ruff`` package is installed, otherwise return it unchanged
+    — so generated files come out already fixed and formatted rather than
+    needing a lint pass afterwards.
+
+    Uses the binary bundled with the ``ruff`` Python package (via
+    ``ruff.find_ruff_bin``), so it works wherever the package is importable —
+    no dependency on a ``ruff`` executable being on ``PATH``.
+    """
+    try:
+        from ruff import find_ruff_bin
+    except ImportError:
+        return code
+    import subprocess
+
+    ruff = find_ruff_bin()
+    for command in (["check", "--fix-only", "-"], ["format", "-"]):
+        try:
+            result = subprocess.run(
+                [ruff, *command],
+                input=code,
+                capture_output=True,
+                # Explicit UTF-8: text mode alone uses the locale encoding,
+                # and on Windows (cp1252) any non-ASCII character in the
+                # source reaches ruff as invalid UTF-8 — it errors and the
+                # code stays unformatted.
+                encoding="utf-8",
+                check=True,
+            )
+        except (OSError, subprocess.SubprocessError):  # pragma: no cover
+            return code
+        code = result.stdout or code
+    return code
+
+
+def to_python(
+    tree: NodeTree | TreeBuilder[Any],
+    min_chain_length: int = 3,
+    strict: bool = True,
+    max_inline_width: int | None = 88,
+    snapshot_positions: bool = False,
+    keep_reroutes: bool = False,
+    top_level: Literal["with", "class"] = "with",
+    format: bool = True,
+    nodebpy_pkg: str = "nodebpy",
+    group_class_names: Mapping[str, str] | None = None,
+    external_groups: Collection[str] | None = None,
+    typed_groups: Collection[str] | None = None,
+    root_interface: GroupInterface | None = None,
+    in_place: bool = False,
+    groups: Literal["inline", "reference"] = "inline",
+    group_modules: Collection[str] | None = None,
+    namespace: Mapping[str, Any] | None = None,
+) -> str:
+    """Generate Python code that recreates the given node tree using nodebpy.
+
+    Parameters
+    ----------
+    tree: TreeBuilder[Any] | bpy.types.NodeTree
+        The node tree to export.
+    min_chain_length: int
+        Minimum number of items (including interface endpoints) for a linear
+        pipeline to be expressed with ``>>`` syntax; shorter runs are emitted
+        as flat assignments.
+    strict: bool
+        If True (default), raise :class:`CodegenError` for nodes that
+        have no nodebpy class and no registered emitter. If False, emit a
+        ``var = None  # TODO`` placeholder instead.
+    max_inline_width: int | None
+        Longest rendered expression (in characters) that may inline into its consumer's
+        statement; longer values bind to a variable first, so deep graphs split into
+        steps instead of collapsing into one huge statement. ``>>`` chain continuations
+        are exempt — a pipeline stays one statement; statements longer than 88 columns
+        wrap in parentheses with one ``>>`` segment per line.
+        ``None`` disables the budget.
+    snapshot_positions: bool
+        If True, build the tree with ``arrange=None`` (no auto-layout) and
+        append a ``tree.layout_snapshot`` block that restores each node's
+        authored name and ``location``. Rebuilt nodes are matched to their
+        authored counterparts structurally (by type, links and frame
+        parent, seeded from exact name matches), so duplicate-type nodes a
+        rebuild names in another order still land on their own authored
+        spots. Nodes a rebuild doesn't recreate (reroutes — unless
+        ``keep_reroutes``) are skipped.
+    keep_reroutes: bool
+        If True, preserve reroute nodes as ``g.Reroute(...)`` pass-throughs
+        instead of collapsing each reroute chain into a direct link. Useful
+        with ``snapshot_positions`` to reproduce the original wire routing.
+    top_level: "with" | "class"
+        How the top-level tree is rendered. ``"with"`` (default) emits a
+        ``with TreeBuilder(...) as tree:`` block. ``"class"`` emits the
+        top-level tree as a ``Custom*Group`` subclass too — so every node
+        group, including the one being exported, becomes a class. Build any
+        of them with ``ClassName.create_group()``; useful for archiving a
+        set of node groups as plain, reusable Python.
+    format: bool
+        If True (default) and the optional ``ruff`` package is installed,
+        the generated source is run through ``ruff format`` for tidier
+        output. A no-op when ``ruff`` is unavailable.
+    nodebpy_pkg: str
+        Import anchor for nodebpy in the generated source. Defaults to the
+        absolute ``"nodebpy"``. When nodebpy is vendored inside another
+        package, pass the path that reaches it *relative to the generated
+        module's package* — e.g. ``"..vendor.nodebpy"`` — so the emitted
+        imports stay relative to the install/vendor location.
+    group_class_names: Mapping[str, str] | None
+        Class name to use for a given tree name, overriding the derived
+        PascalCase name — for callers that split groups across several
+        generated modules and need the names to agree between them.
+    external_groups: Collection[str] | None
+        Tree names whose classes are defined in another module: they are
+        referenced by their ``group_class_names`` entry (which must exist)
+        but no class definition is emitted for them. The caller is
+        responsible for making the name resolvable (e.g. an import).
+    typed_groups: Collection[str] | None
+        Tree names whose classes carry a typed ``__init__`` (merged dump
+        classes) — group calls to them are emitted with the normalized
+        parameter names from ``typed_param_names`` instead of socket-name
+        keyword keys.
+    root_interface: GroupInterface | None
+        Typed-interface parts (docstring, class attributes, accessors and
+        ``__init__``) spliced into the top-level tree's class in ``class``
+        mode, ahead of ``_build_group``.
+    in_place: bool
+        If True, the ``with`` header is emitted as
+        ``with g.tree("Name", clear=True) as tree:`` so running the source
+        rebuilds the exported tree in place — the same datablock, emptied
+        first — instead of creating a ``Name.001`` copy, keeping modifiers,
+        group nodes and pinned editors attached across re-runs. Only the
+        top-level tree is rebuilt this way: nested groups are emitted as
+        ``Custom*Group`` classes whose ``create_group()`` reuses an existing
+        tree of the same name, so edits to them only take effect through
+        :func:`nodebpy.live.run_source`. Ignored with ``top_level="class"``
+        (a class is rebuilt by ``run_source``, not by a header).
+    groups: "inline" | "reference"
+        ``"inline"`` (default) writes every nested group out as a class.
+        ``"reference"`` calls the class that already builds a group instead,
+        so a tree using Blender's bundled assets (``g.Array``), nodebpy's own
+        groups or a group class from your own modules exports as just that
+        tree — the code you would have written. A group no loaded class builds,
+        or one changed by hand since nodebpy built it, is still written out.
+        See :mod:`nodebpy.export._groups` for how groups are matched.
+    group_modules: Collection[str] | None
+        With ``groups="reference"``: modules (packages include their
+        submodules) to import first, so their group classes can be matched.
+        By default, the package of dumped sources that the nearest
+        ``pyproject.toml``'s ``[tool.nodebpy.assets]`` table names, if any.
+    namespace: Mapping[str, Any] | None
+        The globals of the script the code goes back into, such as
+        :attr:`nodebpy.live.RunResult.namespace`. A group class bound there
+        is called by that name, without an import, and is preferred over
+        other loaded classes building the same tree; a class reached through
+        a module bound there is called as ``module.Class``. A group written
+        out takes the name of the script's class for it, so the code
+        replaces that class. :meth:`nodebpy.live.RunResult.to_python` passes
+        it for you.
+
+    Returns
+    -------
+    str
+        Python source code as a string.
+    """
+    node_tree: NodeTree = tree.tree if hasattr(tree, "tree") else tree  # ty: ignore[invalid-assignment]
+
+    class_names = dict(group_class_names or {})
+    externals = set(external_groups or ())
+    if missing := externals - class_names.keys():
+        raise ValueError(
+            f"external_groups without a group_class_names entry: {sorted(missing)}"
+        )
+
+    if groups == "reference":
+        from . import _groups
+
+        modules = group_modules
+        if modules is None:
+            modules = _groups.configured_modules()
+        _groups.import_modules(modules)
+
+    script: dict[type, str] = {}
+    modules: dict[str, ModuleType] = {}
+    if namespace is not None:
+        from . import _groups
+
+        for cls, name in _groups.namespace_classes(namespace).items():
+            script[cls] = name
+            if (built := _groups.tree_name(cls)) is not None:
+                class_names.setdefault(built, name)
+        modules = {
+            name: value
+            for name, value in namespace.items()
+            if isinstance(value, ModuleType) and not name.startswith("__")
+        }
+
+    collector = _GroupCollector(
+        min_chain_length=min_chain_length,
+        strict=strict,
+        max_inline_width=max_inline_width,
+        snapshot_positions=snapshot_positions,
+        keep_reroutes=keep_reroutes,
+        group_class_names=class_names,
+        external_groups=externals,
+        typed_groups=set(typed_groups or ()),
+        root_interface=root_interface,
+        root_tree_name=node_tree.name if root_interface is not None else None,
+        reference_groups=groups == "reference",
+        nodebpy_pkg=nodebpy_pkg,
+        script_classes=script,
+        script_modules=modules,
+        # Reserve every assigned name so a locally derived one never shadows a
+        # class the caller imports from another module.
+        used_names=set(class_names.values()),
+    )
+
+    # In "class" mode the top-level tree is registered as a Custom*Group class
+    # too (alongside any nested groups); in "with" mode it stays a `with` block.
+    emission: _TreeEmission | None = None
+    if top_level == "class":
+        collector.register(node_tree)
+        used_aliases = collector.used_aliases
+    else:
+        emission = _emit_tree(node_tree, collector)
+        used_aliases = emission.used_aliases | collector.used_aliases
+
+    # 5. Assemble the module: imports, group classes, then the tree block (only
+    #    in "with" mode), each top-level block separated by two blank lines.
+    import_parts = [
+        f"{_ALIAS_MODULES[alias]} as {alias}"
+        for alias in ("g", "s", "c")
+        if alias in used_aliases
+    ]
+    # TreeBuilder anchors the `with` block and annotates every generated
+    # ``_build_group(self, tree: TreeBuilder)``, so editors type the whole
+    # body of a dumped class.
+    import_names = import_parts + ["TreeBuilder"]
+    lines: list[str] = []
+    if collector.tree_param_types:
+        # The ``tree: TreeBuilder[GeometryNodeTree]`` annotations on emitted
+        # classes reference the bpy tree types by name.
+        lines.append(
+            "from bpy.types import " + ", ".join(sorted(collector.tree_param_types))
+        )
+    if import_names:
+        lines.append(f"from {nodebpy_pkg} import " + ", ".join(import_names))
+    if collector.bases_used:
+        lines.append(
+            f"from {nodebpy_pkg}.builder import "
+            + ", ".join(sorted(collector.bases_used))
+        )
+    for module, names in sorted(collector.group_imports.items()):
+        imported = (
+            n if n == local else f"{n} as {local}" for n, local in names.items()
+        )
+        lines.append(f"from {module} import " + ", ".join(sorted(imported)))
+    # Group classes are top-level defs: two blank lines around each (PEP 8).
+    for class_def in collector.class_defs:
+        lines.extend(["", "", class_def])
+
+    if top_level == "with":
+        assert emission is not None
+        lines.append("")  # one blank line before the tree block
+        if collector.class_defs:
+            lines.append("")  # ...two, when a class def precedes it
+
+        constructor = _TREE_CONSTRUCTORS.get(node_tree.bl_idname, "TreeBuilder")
+        ctor_args = [_fmt(node_tree.name)]
+        # Auto-layout dissolves reroutes and overwrites locations, so disable it
+        # for either option.
+        if snapshot_positions or keep_reroutes:
+            ctor_args.append("arrange=None")
+        if in_place:
+            ctor_args.append("clear=True")
+        # The modifier/tool flags are constructor options; the other tree
+        # properties only the class form carries.
+        tree_props = _tree_prop_overrides(node_tree)
+        for flag in ("is_modifier", "is_tool"):
+            if tree_props.get(flag):
+                ctor_args.append(f"{flag}=True")
+        lines.append(f"with {constructor}({', '.join(ctor_args)}) as tree:")
+        lines.extend(_assemble_tree_body(emission))
+
+        if snapshot_positions:
+            # Snapshot first: renaming consumers to their authored names is
+            # what lets the splits block find them and move their links.
+            lines.append("")
+            lines.extend(
+                _layout_snapshot_lines(
+                    node_tree, indent="", keep_reroutes=keep_reroutes
+                )
+            )
+            splits = _group_input_split_lines(node_tree, "", keep_reroutes)
+            if splits:
+                lines.append("")
+                lines.extend(splits)
+
+    # Datablock defaults (a Material/Object/Image socket value) render as
+    # guarded ``bpy.data.<collection>.get("name")`` lookups, so the module
+    # needs a bare ``import bpy`` to resolve them on rebuild.
+    # Math-constant expressions (from _fmt_float) need the stdlib import.
+    if any(re.search(r"\bmath\.(pi|tau|e)\b", line) for line in lines):
+        lines.insert(0, "import math")
+    if any("bpy.data." in line for line in lines):
+        lines.insert(0, "import bpy")
+    code = "\n".join(lines)
+    return _format_with_ruff(code) if format else code
+
+
+def _group_input_split_lines(
+    node_tree, indent: str, keep_reroutes: bool = False
+) -> list[str]:
+    """A ``tree.group_input_splits = [...]`` assignment recreating the extra
+    Group Input instances an author placed near consumers (with unused
+    sockets hidden) — the editor convention that avoids one input node
+    trailing long noodles. ``TreeBuilder.group_input_splits`` applies them by
+    name — the block runs after ``tree.layout_snapshot`` has restored the
+    consumers' authored names — and each entry carries the instance's
+    authored location and frame parent."""
+    from ..builder._utils import socket_key
+
+    instances = [n for n in node_tree.nodes if n.bl_idname == "NodeGroupInput"]
+    if len(instances) <= 1:
+        return []
+    # The rebuilt tree's primary input node is named "Group Input"; the
+    # same-named authored instance (or the first) keeps that role, and every
+    # other instance is split off it.
+    primary = next((n for n in instances if n.name == "Group Input"), instances[0])
+    outgoing: dict[str, list[_Link]] = {}
+    for link in _effective_links(node_tree, keep_reroutes):
+        outgoing.setdefault(link.from_node.name, []).append(link)
+
+    lines = [
+        f"{indent}# Restore the authored extra Group Input instances.",
+        f"{indent}tree.group_input_splits = [",
+    ]
+    # Sorted (instances by name, links by content): the collections follow
+    # creation order, which a rebuild shuffles — sorting keeps a re-dump
+    # byte-stable.
+    for node in sorted(instances, key=lambda n: n.name):
+        if node is primary:
+            continue
+        entries = sorted(
+            (
+                link.from_socket.name,
+                link.to_node.name,
+                socket_key(link.to_socket),
+            )
+            for link in outgoing.get(node.name, ())
+        )
+        loc = tuple(round(v, 2) for v in node.location)
+        parent = _fmt(node.parent.name) if node.parent is not None else "None"
+        lines.append(f"{indent}    {{")
+        lines.append(f'{indent}        "name": {_fmt(node.name)},')
+        if node.label:
+            lines.append(f'{indent}        "label": {_fmt(node.label)},')
+        lines.append(f'{indent}        "location": {_fmt(loc)},')
+        lines.append(f'{indent}        "parent": {parent},')
+        lines.append(f'{indent}        "links": [')
+        for entry in entries:
+            lines.append(f"{indent}            {_fmt(entry)},")
+        lines.append(f"{indent}        ],")
+        lines.append(f"{indent}    }},")
+    lines.append(f"{indent}]")
+    return lines
+
+
+def _layout_snapshot_lines(
+    node_tree, indent: str, keep_reroutes: bool = False
+) -> list[str]:
+    """A ``tree.layout_snapshot = {...}`` assignment at ``indent`` that
+    restores each node's authored name and location.
+
+    A rebuild names duplicate-type nodes by creation order (``Math``,
+    ``Math.001``, ...), which rarely matches the authored order — restoring
+    positions by bare name would place nodes at each other's authored spots.
+    Each entry therefore also records the node's type, frame parent and
+    incoming links, and :attr:`TreeBuilder.layout_snapshot` matches rebuilt
+    nodes to entries structurally before renaming and placing them.
+    References the local ``tree`` (the top-level ``with`` target, or a
+    group's ``_build_group`` parameter)."""
+    from ..builder._utils import socket_key
+
+    # Only the links a rebuild recreates: inert links are dropped and (without
+    # keep_reroutes) reroute chains collapse to their real endpoints — the
+    # same normalization the emitted body goes through. Sockets are recorded
+    # by rebuild-stable key, not identifier — see :func:`socket_key`.
+    links = _effective_links(node_tree, keep_reroutes)
+    incoming: dict[str, list[tuple[str, str, str]]] = {}
+    for link in links:
+        incoming.setdefault(link.to_node.name, []).append(
+            (
+                socket_key(link.to_socket),
+                link.from_node.name,
+                socket_key(link.from_socket),
+            )
+        )
+
+    lines = [
+        f"{indent}# Restore authored node names and positions (matched by tree",
+        f"{indent}# structure — see TreeBuilder.layout_snapshot).",
+        f"{indent}tree.layout_snapshot = {{",
+    ]
+    skip_reroutes = not keep_reroutes
+    # Extra Group Input instances don't exist yet when the snapshot applies —
+    # the splits block that follows creates and places them.
+    instances = [n for n in node_tree.nodes if n.bl_idname == "NodeGroupInput"]
+    primary_input = next(
+        (n.name for n in instances if n.name == "Group Input"),
+        instances[0].name if instances else None,
+    )
+    # Sorted (nodes by name, links by content): the collections follow
+    # creation order, which a rebuild shuffles — sorting keeps a re-dump
+    # byte-stable.
+    for node in sorted(node_tree.nodes, key=lambda n: n.name):
+        if skip_reroutes and node.bl_idname == "NodeReroute":
+            continue
+        if node.bl_idname == "NodeGroupInput" and node.name != primary_input:
+            continue
+        # Two decimals: auto-layout produces quarter-unit positions (6.75)
+        # that one decimal would visibly nudge on rebuild.
+        loc = tuple(round(v, 2) for v in node.location)
+        parent = _fmt(node.parent.name) if node.parent is not None else "None"
+        entry_links = "".join(
+            f"{_fmt(entry)}, " for entry in sorted(incoming.get(node.name, ()))
+        )
+        lines.append(
+            f"{indent}    {_fmt(node.name)}: ({_fmt(node.bl_idname)}, "
+            f"{_fmt(loc)}, {parent}, ({entry_links})),"
+        )
+    lines.append(f"{indent}}}")
+    return lines
+
+
+def _assemble_tree_body(emission: _TreeEmission) -> list[str]:
+    """The indented lines inside a ``with ... as tree:`` block (or, re-indented,
+    a ``_build_group`` method)."""
+    iface_lines, body, out_lines = (
+        emission.iface_lines,
+        emission.body_lines,
+        emission.out_lines,
+    )
+    lines = list(iface_lines)
+    if iface_lines and (body or out_lines):
+        lines.append("")
+    lines.extend(body)
+    if out_lines:
+        if body:
+            lines.append("")
+        lines.extend(out_lines)
+    if not (iface_lines or body or out_lines):
+        lines.append("    pass")
+    return lines
+
+
+@dataclass
+class _TreeEmission:
+    """The interface, body, and output lines of a single tree (without the
+    surrounding ``with``/class wrapper). Lines carry their in-block 4-space
+    indent."""
+
+    iface_lines: list[str]
+    body_lines: list[str]
+    out_lines: list[str]
+    used_aliases: set[str]
+
+
+@dataclass
+class GroupInterface:
+    """Typed-interface parts spliced into a generated group class.
+
+    Produced by ``nodebpy.assets`` introspection of the live tree (docstring,
+    ``_Inputs``/``_Outputs`` accessors, typed ``__init__``) and merged into
+    the class emitted around ``_build_group``, so one class both documents the
+    group and carries the recipe that regenerates it.
+    """
+
+    docstring: str  # rendered '"""…"""' block, pre-indented to class-body depth
+    body: str  # accessors + TYPE_CHECKING + __init__, pre-indented block
+    base: str | None = None  # override base class (e.g. "AssetGeometryGroup")
+    attr_lines: list[str] = field(default_factory=list)  # e.g. _asset_name/_library
+
+
+# bl_idname of a group node → the CustomGroup base it round-trips to.
+_GROUP_BASES = {
+    "GeometryNodeGroup": "CustomGeometryGroup",
+    "ShaderNodeGroup": "CustomShaderGroup",
+    "CompositorNodeGroup": "CustomCompositorGroup",
+}
+
+# bl_idname of an inner node *tree* → the CustomGroup base, used when emitting a
+# nested group's class (the group node's bl_idname isn't available there).
+_GROUP_BASE_FOR_TREE = {
+    "GeometryNodeTree": "CustomGeometryGroup",
+    "ShaderNodeTree": "CustomShaderGroup",
+    "CompositorNodeTree": "CustomCompositorGroup",
+}
+
+
+@dataclass
+class _GroupCollector:
+    """Tracks nested-group class emission across one ``to_python`` call.
+
+    Each distinct inner node tree becomes one ``CustomGroup`` subclass,
+    rendered into :attr:`class_defs` in dependency order (a group is appended
+    only after the groups it nests, since ``register`` recurses first)."""
+
+    min_chain_length: int
+    strict: bool
+    max_inline_width: int | None
+    snapshot_positions: bool = False
+    keep_reroutes: bool = False
+    # Tree name → class name to use, overriding the derived name. Lets a
+    # caller that splits groups across modules keep names globally consistent.
+    group_class_names: dict[str, str] = field(default_factory=dict)
+    # Tree names whose classes are defined elsewhere (the caller provides the
+    # import): referenced by their assigned name, never emitted here.
+    external_groups: set[str] = field(default_factory=set)
+    # Tree names whose classes have a typed __init__ (merged dump classes):
+    # calls to them use typed_param_names kwargs instead of socket-name keys.
+    typed_groups: set[str] = field(default_factory=set)
+    # Interface parts for the top-level tree's class (class mode only),
+    # matched by tree name.
+    root_interface: GroupInterface | None = None
+    root_tree_name: str | None = None
+    class_defs: list[str] = field(default_factory=list)
+    names_by_tree: dict[str, str] = field(default_factory=dict)
+    used_names: set[str] = field(default_factory=set)
+    bases_used: set[str] = field(default_factory=set)
+    used_aliases: set[str] = field(default_factory=set)
+    # bpy.types names the emitted ``tree: TreeBuilder[...]`` annotations need.
+    tree_param_types: set[str] = field(default_factory=set)
+    # groups="reference": call the loaded class that builds a group instead
+    # of emitting one (see nodebpy.export._groups).
+    reference_groups: bool = False
+    nodebpy_pkg: str = "nodebpy"
+    # Module → {class name: name it is imported as} for referenced classes.
+    group_imports: dict[str, dict[str, str]] = field(default_factory=dict)
+    referenced: dict[type, str | None] = field(default_factory=dict)
+    # The script's group classes by the name it binds them to, and the
+    # modules it binds (see to_python's ``namespace``).
+    script_classes: dict[type, str] = field(default_factory=dict)
+    script_modules: dict[str, ModuleType] = field(default_factory=dict)
+
+    def reference(self, node: Node) -> tuple[str, dict[str, str] | None] | None:
+        """The name to call a loaded class by when it builds ``node``'s
+        group, with its typed parameters (see :func:`_groups.reference`)."""
+        if not self.reference_groups:
+            return None
+        from . import _groups
+
+        ref = _groups.reference(node, prefer=self.script_classes.keys())
+        if ref is None:
+            return None
+        if ref.cls not in self.referenced:
+            self.referenced[ref.cls] = self._reference_name(ref.cls)
+        name = self.referenced[ref.cls]
+        return None if name is None else (name, ref.params)
+
+    def _reference_name(self, cls: type) -> str | None:
+        import nodebpy
+
+        from . import _groups
+
+        name = cls.__name__
+        for alias, module in _ALIAS_MODULES.items():
+            if getattr(getattr(nodebpy, module), name, None) is cls:
+                self.used_aliases.add(alias)
+                return f"{alias}.{name}"
+        if cls in self.script_classes:
+            return self.script_classes[cls]
+        for bound, module in self.script_modules.items():
+            if getattr(module, name, None) is cls:
+                return f"{bound}.{name}"
+        if cls.__module__ in _groups.SCRIPT_MODULES:
+            # Defined by the script the code goes back into: no import, and
+            # no other name to give it.
+            if name in self.used_names:
+                return None
+            self.used_names.add(name)
+            return name
+        module = cls.__module__
+        if module == "nodebpy" or module.startswith("nodebpy."):
+            module = self.nodebpy_pkg + module[len("nodebpy") :]
+        local, n = name, 1
+        while local in self.used_names:
+            n += 1
+            local = f"{name}{n}"
+        self.used_names.add(local)
+        self.group_imports.setdefault(module, {})[name] = local
+        return local
+
+    def register(self, node_tree: NodeTree) -> str:
+        """Ensure a class exists for ``node_tree`` and return its name."""
+        existing = self.names_by_tree.get(node_tree.name)
+        if existing is not None:
+            return existing
+        if node_tree.name in self.external_groups:
+            class_name = self.group_class_names[node_tree.name]
+            self.names_by_tree[node_tree.name] = class_name
+            return class_name
+        class_name = self._unique_name(node_tree.name)
+        # Reserve before recursing so a self-referential group resolves.
+        self.names_by_tree[node_tree.name] = class_name
+        emission = _emit_tree(node_tree, self)
+        self.used_aliases |= emission.used_aliases
+        base = _GROUP_BASE_FOR_TREE.get(node_tree.bl_idname, "CustomGeometryGroup")
+        interface = (
+            self.root_interface if node_tree.name == self.root_tree_name else None
+        )
+        if interface is not None and interface.base:
+            base = interface.base
+        self.bases_used.add(base)
+        if node_tree.bl_idname in _GROUP_BASE_FOR_TREE:
+            # A tree's bl_idname doubles as its bpy.types class name, which
+            # parameterizes the emitted ``tree: TreeBuilder[...]`` annotation.
+            self.tree_param_types.add(node_tree.bl_idname)
+        self.class_defs.append(
+            _render_group_class(
+                class_name,
+                node_tree,
+                base,
+                emission,
+                self.snapshot_positions,
+                self.keep_reroutes,
+                interface,
+            )
+        )
+        return class_name
+
+    def _unique_name(self, tree_name: str) -> str:
+        assigned = self.group_class_names.get(tree_name)
+        if assigned is not None:
+            self.used_names.add(assigned)
+            return assigned
+        base = _class_name(tree_name)
+        name, n = base, 1
+        while name in self.used_names:
+            n += 1
+            name = f"{base}{n}"
+        self.used_names.add(name)
+        return name
+
+
+def _class_name(name: str) -> str:
+    """A valid, PascalCase Python class name derived from a tree name."""
+    cleaned = "".join(p[:1].upper() + p[1:] for p in re.split(r"\W+", name) if p)
+    if not cleaned or cleaned[0].isdigit():
+        cleaned = f"Group{cleaned}"
+    if keyword.iskeyword(cleaned):
+        cleaned += "_"
+    return cleaned
+
+
+# Tree-level properties that affect how a group behaves or presents
+# (description, modifier/tool flags, tool modes and object types, default
+# group-node width) but aren't part of the node graph. Only values differing
+# from a fresh tree's defaults are emitted, as ``_tree_properties`` on the
+# generated class; properties a Blender version doesn't have are skipped.
+_TREE_PROP_CANDIDATES = (
+    "description",
+    "default_group_node_width",
+    "node_tool_idname",
+    "show_modifier_manage_panel",
+    "is_modifier",
+    "is_strip_modifier",
+    "is_tool",
+    "is_mode_object",
+    "is_mode_edit",
+    "is_mode_sculpt",
+    "is_mode_paint",
+    "use_wait_for_click",
+    "is_type_mesh",
+    "is_type_curve",
+    "is_type_pointcloud",
+    "is_type_grease_pencil",
+    "allow_usage_in_scene_compositor_effect",
+)
+
+
+# Fresh-tree defaults of the candidate properties, probed once per tree type.
+_TREE_PROP_DEFAULTS: dict[str, dict[str, Any]] = {}
+
+
+def _tree_prop_overrides(node_tree) -> dict[str, Any]:
+    """Tree-level properties of ``node_tree`` differing from a fresh tree's
+    defaults, probed once per tree type against a throwaway tree."""
+    tree_idname = node_tree.bl_idname
+    if tree_idname not in _TREE_PROP_DEFAULTS:
+
+        def collect(probe) -> dict[str, Any]:
+            return {
+                name: getattr(probe, name)
+                for name in _TREE_PROP_CANDIDATES
+                if hasattr(probe, name)
+            }
+
+        _TREE_PROP_DEFAULTS[tree_idname] = _with_probe_tree(tree_idname, collect, {})
+    return {
+        name: value
+        for name, default in _TREE_PROP_DEFAULTS[tree_idname].items()
+        if (value := getattr(node_tree, name)) != default
+    }
+
+
+def _node_prop_lines(node) -> list[str]:
+    """Assignments for node-instance properties no constructor expresses (a
+    muted/bypassed node, non-default warning propagation), rendered as
+    ``<attr> = <value>`` to append after ``<var>.node.``."""
+    lines: list[str] = []
+    if getattr(node, "mute", False):
+        lines.append("mute = True")
+    if getattr(node, "warning_propagation", "ALL") != "ALL":
+        lines.append(f"warning_propagation = {_fmt(node.warning_propagation)}")
+    return lines
+
+
+# -- Curve mappings (Float Curve, RGB/Vector Curves, Hue Correct) -----------
+
+_MAPPING_ATTRS = (
+    "extend",
+    "tone",
+    "use_clip",
+    "clip_min_x",
+    "clip_min_y",
+    "clip_max_x",
+    "clip_max_y",
+    "black_level",
+    "white_level",
+)
+
+
+def _mapping_attr_value(mapping, name):
+    value = getattr(mapping, name)
+    if isinstance(value, (str, bool, int, float)):
+        return value
+    return tuple(value)
+
+
+def _mapping_state(mapping) -> tuple:
+    """A comparable snapshot of a ``CurveMapping``: its attrs plus every
+    curve's points (location, handle type, selection)."""
+    attrs = tuple(
+        (name, _norm_floats(_mapping_attr_value(mapping, name)))
+        for name in _MAPPING_ATTRS
+        if hasattr(mapping, name)
+    )
+    curves = tuple(
+        tuple(
+            (
+                _norm_floats(tuple(point.location)),
+                point.handle_type,
+                bool(point.select),
+            )
+            for point in curve.points
+        )
+        for curve in mapping.curves
+    )
+    return (attrs, curves)
+
+
+def _norm_floats(value):
+    if isinstance(value, float):
+        return round(value, 5)
+    if isinstance(value, tuple):
+        return tuple(_norm_floats(v) for v in value)
+    return value
+
+
+_FRESH_MAPPING_CACHE: dict[tuple[str, str], tuple | None] = {}
+
+# Nodes whose constructor takes the curve points as ``items=`` (written by the
+# node's emitter), so only the mapping's other settings need statements.
+_MAPPING_POINTS_AS_ITEMS = {"ShaderNodeFloatCurve"}
+
+
+def _fresh_mapping_state(tree_idname: str, bl_idname: str) -> tuple | None:
+    key = (tree_idname, bl_idname)
+    if key not in _FRESH_MAPPING_CACHE:
+
+        def probe(tree):
+            node = tree.nodes.new(bl_idname)
+            mapping = getattr(node, "mapping", None)
+            if mapping is None or not hasattr(mapping, "curves"):
+                return None  # pragma: no cover - callers checked already
+            return _mapping_state(mapping)
+
+        _FRESH_MAPPING_CACHE[key] = _with_probe_tree(tree_idname, probe, None)
+    return _FRESH_MAPPING_CACHE[key]
+
+
+def _has_custom_mapping(node, tree_idname: str) -> bool:
+    """Whether the node carries a curve mapping differing from a fresh one."""
+    mapping = getattr(node, "mapping", None)
+    if mapping is None or not hasattr(mapping, "curves"):
+        return False
+    state = _mapping_state(mapping)
+    fresh = _fresh_mapping_state(tree_idname, node.bl_idname)
+    if node.bl_idname in _MAPPING_POINTS_AS_ITEMS:
+        # ``items=`` carries the points; only other settings and selection
+        # (the constructor deselects every point) need statements.
+        selected = any(select for curve in state[1] for _, _, select in curve)
+        return fresh is None or state[0] != fresh[0] or selected
+    return state != fresh
+
+
+def _node_mapping_lines(
+    node, tree_idname: str, accessor: str, counter: dict[str, int]
+) -> list[str]:
+    """Statements that reproduce the node's edited curve mapping.
+
+    Point locations don't resort until ``update()`` runs, so extra points are
+    first created at large dummy x (appending them at the end), every point
+    is then assigned by index in the mapping's own (x-sorted) order, and one
+    final ``update()`` re-sorts — a no-op, since the targets were sorted."""
+    mapping = node.mapping
+    fresh = _fresh_mapping_state(tree_idname, node.bl_idname)
+    fresh_attrs = dict(fresh[0]) if fresh is not None else {}
+    map_ref = f"{accessor}.mapping"
+    lines: list[str] = []
+    for name in _MAPPING_ATTRS:
+        if not hasattr(mapping, name):
+            continue  # pragma: no cover - all current mappings carry them
+        value = _mapping_attr_value(mapping, name)
+        if fresh is None or fresh_attrs.get(name) != _norm_floats(value):
+            lines.append(f"{map_ref}.{name} = {_fmt(value)}")
+    fresh_curves = fresh[1] if fresh is not None else None
+    state_curves = _mapping_state(mapping)[1]
+    curves = () if node.bl_idname in _MAPPING_POINTS_AS_ITEMS else mapping.curves
+    for index, curve in enumerate(curves):
+        if (
+            fresh_curves is not None
+            and index < len(fresh_curves)
+            and state_curves[index] == fresh_curves[index]
+        ):
+            continue
+        var = _make_var("curve", counter)
+        lines.append(f"{var} = {map_ref}.curves[{index}]")
+        fresh_count = (
+            len(fresh_curves[index])
+            if fresh_curves is not None and index < len(fresh_curves)
+            else 2
+        )
+        for extra in range(len(curve.points) - fresh_count):
+            # Dummy x beyond any real curve keeps the new point at the end.
+            lines.append(f"{var}.points.new({1e6 + extra}, 0.0)")
+        for _ in range(fresh_count - len(curve.points)):
+            lines.append(f"{var}.points.remove({var}.points[-1])")
+        for j, point in enumerate(curve.points):
+            lines.append(f"{var}.points[{j}].location = {_fmt(tuple(point.location))}")
+            if point.handle_type != "AUTO":
+                lines.append(
+                    f"{var}.points[{j}].handle_type = {_fmt(point.handle_type)}"
+                )
+            # Selection is part of the stored state (and ``points.new`` may
+            # select what it creates), so it is always written out.
+            lines.append(f"{var}.points[{j}].select = {point.select}")
+    lines.append(f"{map_ref}.update()")
+    if node.bl_idname in _MAPPING_POINTS_AS_ITEMS:
+        # Selected after ``update()`` so it can't clamp them to the clip range.
+        for index, curve in enumerate(mapping.curves):
+            for j, point in enumerate(curve.points):
+                if point.select:
+                    lines.append(f"{map_ref}.curves[{index}].points[{j}].select = True")
+    return lines
+
+
+def _render_group_class(
+    class_name: str,
+    node_tree,
+    base: str,
+    emission: _TreeEmission,
+    snapshot_positions: bool = False,
+    keep_reroutes: bool = False,
+    interface: GroupInterface | None = None,
+) -> str:
+    """A ``class X(CustomGroup): _name = ...; def _build_group(self, tree): ...``
+    block, with the tree body re-indented one level deeper.
+
+    With ``interface``, the class also carries its typed API — docstring,
+    ``_asset_name``/``_library`` attributes, accessors and typed ``__init__``
+    — ahead of ``_build_group``."""
+    header = [f"class {class_name}({base}):"]
+    if interface is not None:
+        header.extend([interface.docstring, ""])
+    header.append(f"    _name = {_fmt(node_tree.name)}")
+    if interface is not None:
+        header.extend(f"    {line}" for line in interface.attr_lines)
+    color = getattr(node_tree, "color_tag", "NONE")
+    if color and color != "NONE":
+        header.append(f"    _color_tag = {_fmt(color)}")
+    tree_props = _tree_prop_overrides(node_tree)
+    if tree_props:
+        rendered = ", ".join(
+            f"{_fmt(key)}: {_fmt(value)}" for key, value in tree_props.items()
+        )
+        header.append(f"    _tree_properties = {{{rendered}}}")
+    if interface is not None:
+        header.extend(["", interface.body])
+    # The tree's bl_idname doubles as its bpy.types class name.
+    annotation = (
+        f"TreeBuilder[{node_tree.bl_idname}]"
+        if node_tree.bl_idname in _GROUP_BASE_FOR_TREE
+        else "TreeBuilder"
+    )
+    header.extend(["", f"    def _build_group(self, tree: {annotation}) -> None:"])
+    inner = _assemble_tree_body(emission)
+    # Either option needs auto-layout off (it dissolves reroutes and overwrites
+    # locations); the disable line goes at the body's "in-block" 4-space indent,
+    # which the re-indent below lifts to the method-body depth.
+    if snapshot_positions or keep_reroutes:
+        inner = ["    tree.disable_arrange()", ""] + inner
+    if snapshot_positions:
+        # Snapshot first: renaming consumers to their authored names is
+        # what lets the splits block find them and move their links.
+        inner = (
+            inner
+            + [""]
+            + _layout_snapshot_lines(
+                node_tree, indent="    ", keep_reroutes=keep_reroutes
+            )
+        )
+        splits = _group_input_split_lines(node_tree, "    ", keep_reroutes)
+        if splits:
+            inner = inner + [""] + splits
+    body = [("    " + line) if line else "" for line in inner]
+    return "\n".join(header + body)
+
+
+def _emit_tree(node_tree, collector: _GroupCollector) -> _TreeEmission:
+    """Generate the interface/body/output lines for one tree. Nested group
+    nodes register their classes on ``collector`` as a side effect."""
+    token = _CURRENT_TREE.set(node_tree.bl_idname)
+    try:
+        return _emit_tree_lines(node_tree, collector)
+    finally:
+        _CURRENT_TREE.reset(token)
+
+
+def _emit_tree_lines(node_tree, collector: _GroupCollector) -> _TreeEmission:
+    links = _effective_links(node_tree, collector.keep_reroutes)
+    incoming: dict[str, list[_Link]] = {}
+    outgoing: dict[str, list[_Link]] = {}
+    for link in links:
+        incoming.setdefault(link.to_node.name, []).append(link)
+        outgoing.setdefault(link.from_node.name, []).append(link)
+
+    ctx = EmitContext(node_tree, links, incoming, outgoing, collector=collector)
+    skip = _SKIP_BL_IDNAMES
+    if collector.keep_reroutes:
+        skip = skip - {"NodeReroute"}  # reroutes emit as ordinary nodes
+    ordered = [
+        n
+        for n in _topo_sort(node_tree, collector.keep_reroutes)
+        if n.bl_idname not in skip
+    ]
+    ordered, frame_path_of, frame_nodes = _frame_order(
+        node_tree, ordered, collector.keep_reroutes
+    )
+
+    iface_lines = _emit_interface_lines(node_tree, ctx)
+
+    chain_in = _chainable_links(ctx)
+    gated_nodes = _gate_short_chains(ctx, chain_in, ordered, collector.min_chain_length)
+
+    # Body lines tagged with the emitting node's frame path (outermost frame
+    # first); nested with-blocks and indentation are applied after the loop
+    # (frame members are contiguous thanks to _frame_order).
+    tagged_body: list[tuple[tuple[str, ...], str]] = []
+    consumed_out_links: set[int] = set()  # id() of tail-inlined _Link tuples
+
+    for node in ordered:
+        name = node.name
+        frame = frame_path_of.get(name, ())
+
+        # 1. Build the node's value:
+        #    emitter → socket method → lift → factory/constructor.
+        val: _Val | None = None
+        emitter = _EMITTERS.get(node.bl_idname)
+        if emitter is not None:
+            emitted = emitter(node, ctx)
+            if emitted is not None:
+                val = emitted if isinstance(emitted, _Val) else _Val(emitted)
+        if val is None:
+            val = _socket_method_val(ctx, node)
+        if val is None:
+            plan = _lift_plan(
+                node, _linked_ids(ctx, node), _linked_src_types(ctx, node)
+            )
+            if plan is not None:
+                val = _Val(
+                    _lift_expr(ctx, node, plan),
+                    is_socket=True,
+                    socket_id=node.outputs[0].identifier if node.outputs else None,
+                )
+        if val is None:
+            if _find_cls(node.bl_idname) is None:
+                message = f"unsupported node '{name}' ({node.bl_idname})"
+                if collector.strict:
+                    raise CodegenError(
+                        f"Cannot generate code: {message}. Register an emitter "
+                        "with register_emitter() or pass strict=False."
+                    )
+                var = _make_var(_node_var_label(node), ctx.counter)
+                if not ctx.outgoing.get(name):
+                    var = "_" + var
+                ctx.var_map[name] = _Val(Ref(var))
+                tagged_body.append((frame, f"    {var} = None  # TODO: {message}"))
+                continue
+            chain_link = chain_in.get(name)
+            call = ctx.constructor(
+                node,
+                skip_input_id=chain_link.to_socket.identifier if chain_link else None,
+            )
+            expr: Expr = (
+                BinOp(">>", ctx.upstream_expr(chain_link, pipeline=True), call)
+                if chain_link
+                else call
+            )
+            val = _Val(expr)
+
+        # Flush any variable promotions queued while building the value.
+        if ctx.pending_lines:
+            tagged_body.extend((frame, line) for line in ctx.pending_lines)
+            ctx.pending_lines.clear()
+
+        # 2. Bind it: inline into the consumer, finish a >> chain, or assign.
+        if val.outputs is not None:
+            # Fully dissolved node (e.g. SeparateXYZ) — consumers reference
+            # the per-output expressions directly; nothing to emit here.
+            ctx.var_map[name] = val
+            continue
+
+        out_links = ctx.outgoing.get(name, ())
+        group_outs = [
+            link for link in out_links if link.to_node.bl_idname == "NodeGroupOutput"
+        ]
+
+        # Node-instance properties no constructor expresses (a muted/bypassed
+        # node, non-default warning propagation, an edited curve mapping)
+        # force a variable binding so they can be applied to the built node
+        # afterwards.
+        node_prop_lines = _node_prop_lines(node)
+        custom_mapping = _has_custom_mapping(node, node_tree.bl_idname)
+
+        if (
+            not node_prop_lines
+            and not custom_mapping
+            and len(out_links) == 1
+            and not group_outs
+            # Inlining would create this node at the consumer's statement —
+            # only allowed when both sit in the same frame path.
+            and frame == frame_path_of.get(out_links[0].to_node.name, ())
+            # Budget: long expressions bind to a variable instead of growing
+            # the consumer's statement; chain continuations stay inline.
+            and (
+                collector.max_inline_width is None
+                or chain_in.get(out_links[0].to_node.name) is out_links[0]
+                or len(val.require_expr().render()) <= collector.max_inline_width
+            )
+        ):
+            ctx.var_map[name] = val  # single consumer → inline
+            continue
+
+        # Gated nodes render no >> syntax; everything else with a single link
+        # to a group output finishes its chain right here.
+        if (
+            not node_prop_lines
+            and not custom_mapping
+            and len(out_links) == 1
+            and group_outs
+            and name not in gated_nodes
+        ):
+            link = group_outs[0]
+            out_ref = ctx.var_map.get(f"_iface_outputs_{link.to_socket.identifier}")
+            if out_ref is None:
+                raise CodegenError(
+                    f"Group output socket '{link.to_socket.name}' has no "
+                    "interface variable"
+                )
+            source = _output_expr(val, node, link.from_socket, pipeline=True)
+            chain = BinOp(">>", source, out_ref.require_expr())
+            width = _MAX_LINE_WIDTH - 4 * len(frame)
+            tagged_body.extend(
+                (frame, line) for line in _stmt_lines(chain, width=width)
+            )
+            consumed_out_links.add(id(link))
+            continue
+
+        var = _make_var(_node_var_label(node), ctx.counter)
+        # A node created purely for its side effect (a gizmo, a dangling
+        # node) is never referenced again — prefix its variable so the
+        # generated module passes lint (F841).
+        if not out_links and not node_prop_lines and not custom_mapping:
+            var = "_" + var
+        width = _MAX_LINE_WIDTH - 4 * len(frame)
+        tagged_body.extend(
+            (frame, line)
+            for line in _stmt_lines(val.require_expr(), assign=var, width=width)
+        )
+        for prop_line in node_prop_lines:
+            # ``.node`` reaches the bpy node from a node wrapper and a socket
+            # wrapper alike, so this works for constructor and method values.
+            tagged_body.append((frame, f"    {var}.node.{prop_line}"))
+        if custom_mapping:
+            tagged_body.extend(
+                (frame, f"    {line}")
+                for line in _node_mapping_lines(
+                    node, node_tree.bl_idname, f"{var}.node", ctx.counter
+                )
+            )
+        ctx.var_map[name] = _Val(
+            Ref(var), is_socket=val.is_socket, socket_id=val.socket_id
+        )
+
+    # 3. Wrap frame members in nested with-blocks. Each line carries its frame
+    # path (outermost first); when the path changes, close the frames no longer
+    # shared and open the newly entered ones. ``line`` already has the base
+    # 4-space indent, so each frame level adds another 4.
+    frame_alias = _TREE_ALIAS.get(node_tree.bl_idname, "g")
+    body: list[str] = []
+    open_path: tuple[str, ...] = ()
+    for path, line in tagged_body:
+        common = 0
+        while (
+            common < len(open_path)
+            and common < len(path)
+            and open_path[common] == path[common]
+        ):
+            common += 1
+        for depth in range(common, len(path)):
+            ctx.used_aliases.add(frame_alias)
+            frame_node = frame_nodes[path[depth]]
+            label = _fmt(frame_node.label) if frame_node.label else ""
+            body.append(f"{'    ' * (depth + 1)}with {frame_alias}.Frame({label}):")
+        open_path = path
+        body.append(("    " * len(path)) + line)
+
+    # 4. Remaining group-output connections.
+    out_lines: list[str] = []
+    for link in links:
+        if link.to_node.bl_idname != "NodeGroupOutput":
+            continue
+        if id(link) in consumed_out_links:
+            continue
+        out_ref = ctx.var_map.get(f"_iface_outputs_{link.to_socket.identifier}")
+        if out_ref is None:
+            raise CodegenError(
+                f"Group output socket '{link.to_socket.name}' has no interface variable"
+            )
+        source = ctx.upstream_expr(link, pipeline=True)
+        out_lines.extend(_stmt_lines(BinOp(">>", source, out_ref.require_expr())))
+
+    return _TreeEmission(iface_lines, body, out_lines, ctx.used_aliases)
+
+
+# ---------------------------------------------------------------------------
+# Built-in emitters
+# ---------------------------------------------------------------------------
+
+
+@register_emitter("ShaderNodeValue")
+def _emit_value(node, ctx: EmitContext) -> Call:
+    """Preserve the Value node's output-backed constructor argument.
+
+    Unlike ordinary node inputs, ``ShaderNodeValue`` stores its editable value
+    directly on its output socket. The generic constructor path only examines
+    input sockets, so a non-zero value needs to be supplied explicitly.
+    """
+    call = ctx.constructor(node)
+    if node.outputs:
+        value = node.outputs[0].default_value
+        if not _eq(value, 0.0):
+            call.args.append(Lit(value))
+    return call
+
+
+_COMPARE_LIFT = {
+    "LESS_THAN": "<",
+    "GREATER_THAN": ">",
+    "LESS_EQUAL": "<=",
+    "GREATER_EQUAL": ">=",
+    "EQUAL": "==",
+    "NOT_EQUAL": "!=",
+}
+
+# data_type the comparison overloads dispatch to, by lhs socket type
+_COMPARE_DISPATCH = {"VALUE": "FLOAT", "INT": "INT", "VECTOR": "VECTOR"}
+
+# epsilon the ==/!= overloads set (float32 of 1e-4)
+_OPERATOR_EPSILON = 9.999999747378752e-05
+
+
+def _lift_compare(node: FunctionNodeCompare, ctx: EmitContext) -> _Val | None:
+    """Lift a Compare node to a Python comparison when its state matches
+    exactly what the operator overloads produce on round-trip."""
+    op = _COMPARE_LIFT.get(node.operation)
+    in_a = _input_socket_by_identifier(node, "A")
+    in_b = _input_socket_by_identifier(node, "B")
+    if (in_a.links and in_b.links) and (
+        in_a.links[0].from_socket.type != in_b.links[0].from_socket.type
+    ):
+        return None
+    if op is None or node.mode != "ELEMENT":
+        return None
+    linked = _linked_ids(ctx, node)
+    if "A" not in linked or not linked <= {"A", "B"}:
+        return None
+    a_link = ctx.input_link(node, "A")
+    assert a_link is not None
+    if _COMPARE_DISPATCH.get(a_link.from_socket.type) != node.data_type:
+        return None
+    if node.operation in ("EQUAL", "NOT_EQUAL"):
+        epsilon = _input_socket_by_identifier(node, "Epsilon")
+        if epsilon is None or not _eq(epsilon.default_value, _OPERATOR_EPSILON):
+            return None
+    b_link = ctx.input_link(node, "B")
+    if b_link is not None:
+        rhs: Expr = ctx.upstream_expr(b_link)
+    else:
+        b_socket = _input_socket_by_identifier(node, "B")
+        if b_socket is None:
+            return None
+        rhs = Lit(b_socket.default_value)
+    return _Val(
+        CompareOp(op, ctx.upstream_expr(a_link), rhs),
+        is_socket=True,
+        socket_id=node.outputs[0].identifier,
+    )
+
+
+@register_emitter("FunctionNodeCompare")
+def _emit_compare(node, ctx: EmitContext) -> Expr | _Val | None:
+    """Lift to a Python comparison when possible; otherwise emit the
+    constructor — Compare's ``mode`` is consumed via ``**kwargs`` (required
+    for VECTOR), so it never appears in the signature and is added
+    explicitly."""
+    lifted = _lift_compare(node, ctx)
+    if lifted is not None:
+        return lifted
+    call = ctx.constructor(node)
+    if node.data_type == "VECTOR":
+        call.kwargs["mode"] = Lit(node.mode)
+    return call
+
+
+@register_emitter("FunctionNodeFormatString")
+def _emit_format_string(node, ctx: EmitContext) -> Expr | _Val | None:
+    """FormatString renders as ``fmt.format({...})`` when the format string
+    is linked, else ``g.FormatString("...", items={...})``. Item names may
+    not be valid Python kwargs, so items always go through a dict."""
+    items: dict[str, Expr] = {}
+    for socket in node.inputs:
+        if socket.identifier == "Format" or socket.identifier.startswith("__extend__"):
+            continue
+        link = ctx.input_link(node, socket.identifier)
+        items[socket.name] = (
+            ctx.upstream_expr(link) if link is not None else Lit(socket.default_value)
+        )
+    format_link = ctx.input_link(node, "Format")
+    if format_link is not None:
+        return _Val(
+            MethodCall(ctx.socket_expr(format_link), "format", [DictExpr(items)]),
+            is_socket=True,
+            socket_id=node.outputs[0].identifier,
+        )
+    format_socket = _input_socket_by_identifier(node, "Format")
+    args: list[Expr] = [
+        Lit(format_socket.default_value if format_socket is not None else "")
+    ]
+    kwargs: dict[str, Expr] = {"items": DictExpr(items)} if items else {}
+    return Call(_tree_alias(ctx, "FormatString"), args, kwargs)
+
+
+@register_emitter("GeometryNodeStringJoin")
+def _emit_join_strings(node, ctx: EmitContext) -> Expr | _Val | None:
+    """JoinStrings renders as ``delimiter.join((...))`` when the delimiter
+    is linked, else ``g.JoinStrings((...), delimiter=...)``. The strings
+    multi-input becomes a tuple in creation order."""
+    entries = [
+        (link.sort_id, ctx.upstream_expr(link))
+        for link in ctx.incoming.get(node.name, ())
+        if link.to_socket.identifier == "Strings"
+    ]
+    entries.sort(key=lambda e: e[0], reverse=True)
+    strings = TupleExpr([e[1] for e in entries])
+    delimiter_link = ctx.input_link(node, "Delimiter")
+    if delimiter_link is not None:
+        return _Val(
+            MethodCall(ctx.socket_expr(delimiter_link), "join", [strings]),
+            is_socket=True,
+            socket_id=node.outputs[0].identifier,
+        )
+    ctx.used_aliases.add("g")
+    kwargs: dict[str, Expr] = {}
+    delimiter = _input_socket_by_identifier(node, "Delimiter")
+    if delimiter is not None and delimiter.default_value:
+        kwargs["delimiter"] = Lit(delimiter.default_value)
+    return Call("g.JoinStrings", [strings], kwargs)
+
+
+@register_emitter("GeometryNodeGeometryToInstance")
+def _emit_geometry_to_instance(node, ctx: EmitContext) -> Expr | _Val | None:
+    """GeometryToInstance takes its multi-input geometry as ``*args``, so its
+    links render as positional arguments (in creation order), not a
+    ``geometry=`` kwarg the varargs constructor would reject."""
+    entries = [
+        (link.sort_id, ctx.upstream_expr(link))
+        for link in ctx.incoming.get(node.name, ())
+        if link.to_socket.identifier == "Geometry"
+    ]
+    entries.sort(key=lambda e: e[0], reverse=True)
+    ctx.used_aliases.add("g")
+    return Call("g.GeometryToInstance", args=[expr for _, expr in entries])
+
+
+@register_emitter("GeometryNodeListGetItem")
+def _emit_list_get_item(node, ctx: EmitContext) -> _Val | None:
+    """``lst[index]`` — list item access. Falls back to the constructor unless
+    the receiver is a list whose element type matches ``socket_type`` (so the
+    rebuilt subscript re-derives the same node)."""
+    list_link = ctx.input_link(node, "List")
+    if list_link is None or not _list_receiver_ok(node, list_link, "socket_type"):
+        return None
+    found = _find_cls(node.bl_idname)
+    if found is not None and set(_non_default_props(node, found[1])) - {"socket_type"}:
+        return None
+    receiver = ctx.socket_expr(list_link)
+    index_link = ctx.input_link(node, "Index")
+    if index_link is not None:
+        index: Expr = ctx.upstream_expr(index_link)
+    else:
+        socket = _input_socket_by_identifier(node, "Index")
+        index = Lit(socket.default_value if socket is not None else 0)
+    return _Val(Subscript(receiver, index), is_socket=True, socket_id="Value")
+
+
+# data_type → MenuSwitch/IndexSwitch factory classmethod name.
+_SWITCH_FACTORY_NAMES = {
+    "FLOAT": "float",
+    "INT": "integer",
+    "BOOLEAN": "boolean",
+    "VECTOR": "vector",
+    "RGBA": "color",
+    "ROTATION": "rotation",
+    "MATRIX": "matrix",
+    "STRING": "string",
+    "MENU": "menu",
+    "OBJECT": "object",
+    "GEOMETRY": "geometry",
+    "COLLECTION": "collection",
+    "IMAGE": "image",
+    "MATERIAL": "material",
+    "BUNDLE": "bundle",
+    "CLOSURE": "closure",
+    "SHADER": "shader",
+    "FONT": "font",
+    "SOUND": "sound",
+}
+
+
+def _switch_item_exprs(node, ctx: EmitContext, skip_id: str) -> list[tuple[str, Expr]]:
+    """(socket name, value expression) per item input, in collection order.
+
+    Unlinked items render their default value, or ``None`` for socket types
+    without one (the constructors declare such items but leave them unlinked).
+    """
+    out: list[tuple[str, Expr]] = []
+    for socket in node.inputs:
+        if socket.identifier == skip_id or socket.identifier.startswith("__extend__"):
+            continue
+        link = ctx.input_link(node, socket.identifier)
+        if link is not None:
+            expr: Expr = ctx.upstream_expr(link)
+        elif hasattr(socket, "default_value"):
+            expr = Lit(socket.default_value)
+        else:
+            expr = Lit(None)
+        out.append((socket.name, expr))
+    return out
+
+
+@register_emitter("GeometryNodeMenuSwitch")
+def _emit_menu_switch(node, ctx: EmitContext) -> Expr | _Val | None:
+    """MenuSwitch emits the factory dict form
+    ``g.MenuSwitch.geometry(menu, {"Name": value, ...})`` — the plain
+    constructor's per-socket kwargs cannot recreate the enum item names.
+    An item with a tooltip emits the ``(value, description)`` pair form.
+    Each tree type has its own MenuSwitch class (with tree-specific factories
+    such as ``shader``), so the alias follows the tree being exported."""
+    factory = _SWITCH_FACTORY_NAMES.get(node.data_type)
+    if factory is None:
+        return None
+    alias = _TREE_ALIAS.get(ctx.node_tree.bl_idname, "g")
+    ctx.used_aliases.add(alias)
+    item_exprs: dict[str, Expr] = {}
+    for (name, expr), item in zip(
+        _switch_item_exprs(node, ctx, "Menu"), node.enum_items
+    ):
+        if item.description:
+            expr = TupleExpr([expr, Lit(item.description)])
+        item_exprs[name] = expr
+    items = DictExpr(item_exprs)
+    menu_link = ctx.input_link(node, "Menu")
+    if menu_link is not None:
+        return Call(
+            f"{alias}.MenuSwitch.{factory}", [ctx.upstream_expr(menu_link), items]
+        )
+    # The constructor defaults the menu selection to the first item; only a
+    # different selection needs an explicit argument.
+    menu_socket = _input_socket_by_identifier(node, "Menu")
+    first_name = node.enum_items[0].name if node.enum_items else ""
+    if menu_socket is not None and menu_socket.default_value != first_name:
+        return Call(
+            f"{alias}.MenuSwitch.{factory}", [Lit(menu_socket.default_value), items]
+        )
+    return Call(f"{alias}.MenuSwitch.{factory}", kwargs={"items": items})
+
+
+@register_emitter("CompositorNodeSwitch")
+def _emit_compositor_legacy_switch(node, ctx: EmitContext) -> Expr | _Val | None:
+    """Blender 5.2 deprecates the compositor's Color-only Switch for the typed
+    one, which ``c.Switch`` builds; a Color Switch does the same job."""
+    ctx.used_aliases.add("c")
+    args: list[Expr] = []
+    for identifier in ("Switch", "Off", "On"):
+        link = ctx.input_link(node, identifier)
+        socket = _input_socket_by_identifier(node, identifier)
+        if link is not None:
+            args.append(ctx.upstream_expr(link))
+        else:
+            args.append(Lit(getattr(socket, "default_value", None)))
+    return Call("c.Switch.color", args)
+
+
+@register_emitter("GeometryNodeIndexSwitch")
+def _emit_index_switch(node, ctx: EmitContext) -> Expr | _Val | None:
+    """IndexSwitch emits the factory tuple form
+    ``g.IndexSwitch.float(index, (a, b, ...))`` so the item count
+    round-trips (the constructor clears and recreates the items). The
+    compositor has its own IndexSwitch class (with ``integer_vector``), so
+    the alias follows the tree being exported."""
+    factory = {**_SWITCH_FACTORY_NAMES, "INT_VECTOR": "integer_vector"}.get(
+        node.data_type
+    )
+    if factory is None:
+        return None
+    alias = _TREE_ALIAS.get(ctx.node_tree.bl_idname, "g")
+    ctx.used_aliases.add(alias)
+    name = f"{alias}.IndexSwitch.{factory}"
+    items = TupleExpr([expr for _, expr in _switch_item_exprs(node, ctx, "Index")])
+    index_link = ctx.input_link(node, "Index")
+    if index_link is not None:
+        return Call(name, [ctx.upstream_expr(index_link), items])
+    index_socket = _input_socket_by_identifier(node, "Index")
+    if index_socket is not None and index_socket.default_value:
+        return Call(name, [Lit(index_socket.default_value), items])
+    return Call(name, kwargs={"items": items})
+
+
+_UNSET = object()
+
+
+# ---------------------------------------------------------------------------
+# Variable-items node emitters (CaptureAttribute / FieldToGrid / Bake /
+# FieldToList / …)
+#
+# These take an ``items={name: field}`` dict; the plain constructor path emits
+# each item input as its own kwarg (``field_0=``), which the constructor does
+# not accept. A small spec names the fixed (non-item) inputs and, where the
+# node has one, the factory method selected by its type/domain property; item
+# sockets are the trailing input/output sockets (one per collection item).
+#
+# Nodes with typed per-item factories (CaptureAttribute / Bake / FieldToGrid)
+# are emitted statement-form instead: one constructor line plus one
+# ``node.items.<type>(value, name)`` line per item, with a handle variable
+# whenever the item's output is read. The typed factory encodes the item type,
+# so declarations can never drift to a different inferred type.
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class _ItemsNodeSpec:
+    collection: str  # bpy items collection attribute
+    fixed: tuple[tuple[str, str], ...] = ()  # (input identifier, param) pairs
+    factory_prop: str | None = None  # node property choosing the factory method
+    factory_map: dict[str, str] | None = None  # property value → method name
+
+
+_ITEMS_NODE_SPECS = {
+    "GeometryNodeFieldToList": _ItemsNodeSpec(
+        collection="list_items", fixed=(("Count", "count"),)
+    ),
+}
+
+
+# capture_items spell their type via ``data_type`` (FLOAT_VECTOR/…), not the
+# socket-type spelling the shared _SWITCH_METHOD map uses.
+_CAPTURE_ITEM_METHOD = {
+    "FLOAT": "float",
+    "INT": "integer",
+    "BOOLEAN": "boolean",
+    "FLOAT_VECTOR": "vector",
+    "FLOAT_COLOR": "color",
+    "QUATERNION": "rotation",
+    "FLOAT4X4": "matrix",
+}
+
+
+@dataclass(frozen=True)
+class _TypedItemsNodeSpec(_ItemsNodeSpec):
+    label: str = "node"  # variable name stem
+    method_map: dict[str, str] | None = None  # item type → factory method
+    fixed_outputs: tuple[tuple[str, str], ...] = ()  # (output id, accessor path)
+    # items with no output socket (Viewer, File Output)
+    item_outputs: bool = True
+    # item outputs matched by identifier rather than being the trailing ones
+    # (Raycast's color items add an "<name> Alpha" output between them)
+    output_pattern: str | None = None
+    # node properties passed to the constructor when they differ from it
+    ctor_props: bool = False
+
+
+_TYPED_ITEMS_NODE_SPECS = {
+    "GeometryNodeCaptureAttribute": _TypedItemsNodeSpec(
+        label="capture",
+        collection="capture_items",
+        fixed=(("Geometry", "geometry"), ("Selection", "selection")),
+        factory_prop="domain",
+        factory_map={
+            "POINT": "point",
+            "EDGE": "edge",
+            "FACE": "face",
+            "CORNER": "corner",
+            "CURVE": "curve",
+            "INSTANCE": "instance",
+            "LAYER": "layer",
+        },
+        method_map=_CAPTURE_ITEM_METHOD,
+        fixed_outputs=(("Geometry", "o.geometry"), ("Selection", "o.selection")),
+    ),
+    "GeometryNodeViewer": _TypedItemsNodeSpec(
+        label="viewer", collection="viewer_items", item_outputs=False, ctor_props=True
+    ),
+    "CompositorNodeOutputFile": _TypedItemsNodeSpec(
+        label="file_output",
+        collection="file_output_items",
+        item_outputs=False,
+        ctor_props=True,
+    ),
+    "ShaderNodeRaycast": _TypedItemsNodeSpec(
+        label="raycast",
+        collection="sample_attribute_items",
+        fixed=(
+            ("Position", "position"),
+            ("Direction", "direction"),
+            ("Length", "length"),
+        ),
+        method_map=_CAPTURE_ITEM_METHOD,
+        fixed_outputs=(
+            ("Is Hit", "o.is_hit"),
+            ("Self Hit", "o.self_hit"),
+            ("Hit Distance", "o.hit_distance"),
+            ("Hit Position", "o.hit_position"),
+            ("Hit Normal", "o.hit_normal"),
+        ),
+        output_pattern=r"Attribute_\d+",
+        ctor_props=True,
+    ),
+    "GeometryNodeBake": _TypedItemsNodeSpec(label="bake", collection="bake_items"),
+    "GeometryNodeFieldToGrid": _TypedItemsNodeSpec(
+        label="field_to_grid",
+        collection="grid_items",
+        fixed=(("Topology", "topology"),),
+        factory_prop="data_type",
+        factory_map={
+            "FLOAT": "float",
+            "INT": "integer",
+            "VECTOR": "vector",
+            "BOOLEAN": "boolean",
+        },
+    ),
+}
+
+
+def _items_fixed_kwargs(
+    node, ctx: EmitContext, spec: _ItemsNodeSpec, fixed_inputs
+) -> dict[str, Expr] | None:
+    """Constructor kwargs for the spec's fixed inputs, or None when a fixed
+    input the call cannot express is linked.
+
+    Linked → upstream; unlinked → literal only when it differs from a fresh
+    node's socket default (so e.g. FieldToList count=5 survives)."""
+    fixed_ids = {ident for ident, _ in spec.fixed}
+    # Any fixed input the spec doesn't name can't be authored — only tolerate
+    # it when unlinked (a stray default we can safely drop).
+    for socket in fixed_inputs:
+        if socket.identifier not in fixed_ids and ctx.input_link(
+            node, socket.identifier
+        ):
+            return None
+    fresh_defaults = _get_blender_socket_defaults(
+        node.id_data.bl_idname, node.bl_idname
+    )
+    kwargs: dict[str, Expr] = {}
+    for ident, param in spec.fixed:
+        link = ctx.input_link(node, ident)
+        if link is not None:
+            kwargs[param] = ctx.upstream_expr(link)
+            continue
+        socket = _input_socket_by_identifier(node, ident)
+        if socket is None or not hasattr(socket, "default_value"):
+            continue
+        fresh = fresh_defaults.get(ident, _UNSET)
+        if fresh is _UNSET or not _eq(socket.default_value, fresh):
+            kwargs[param] = Lit(socket.default_value)
+    return kwargs
+
+
+def _items_node_ctor(
+    alias: str, cls, spec: _ItemsNodeSpec, node, kwargs: dict[str, Expr]
+) -> Call:
+    """The (possibly factory-classmethod) constructor call for an items node."""
+    if spec.factory_prop is not None:
+        prop_value = getattr(node, spec.factory_prop)
+        method = (spec.factory_map or {}).get(prop_value)
+        if method is not None:
+            return Call(f"{alias}.{cls.__name__}.{method}", kwargs=kwargs)
+        kwargs[spec.factory_prop] = Lit(prop_value)
+    return _constructor_call(f"{alias}.{cls.__name__}", cls, node, kwargs)
+
+
+def _emit_items_node(node, ctx: EmitContext) -> Expr | _Val | None:
+    """A variable-items node as ``Factory(fixed=..., items={name: field})``
+    (or the plain constructor when the node has no type/domain factory).
+
+    Bails (falls through) when an input the call cannot express — e.g. a
+    linked FieldToList ``Count``-adjacent socket — is in use, since no
+    faithful call exists."""
+    spec = _ITEMS_NODE_SPECS.get(node.bl_idname)
+    found = _find_cls(node.bl_idname)
+    if spec is None or found is None:
+        return None
+    alias, cls = found
+
+    n_items = len(getattr(node, spec.collection))
+    in_sockets = [s for s in node.inputs if not s.identifier.startswith("__extend__")]
+    split = len(in_sockets) - n_items
+    fixed_inputs, item_inputs = in_sockets[:split], in_sockets[split:]
+
+    kwargs = _items_fixed_kwargs(node, ctx, spec, fixed_inputs)
+    if kwargs is None:  # pragma: no cover - FieldToList's fixed input is authorable
+        return None
+
+    items: dict[str, Expr] = {}
+    for socket, item in zip(item_inputs, getattr(node, spec.collection)):
+        link = ctx.input_link(node, socket.identifier)
+        if link is not None:
+            items[socket.name] = ctx.upstream_expr(link)
+        elif hasattr(socket, "default_value"):
+            items[socket.name] = Lit(socket.default_value)
+        else:  # pragma: no cover - every FieldToList item socket has a default
+            items[socket.name] = Lit(
+                getattr(item, "socket_type", None) or getattr(item, "data_type", "")
+            )
+    kwargs["items"] = DictExpr(items)
+
+    ctx.used_aliases.add(alias)
+    return _items_node_ctor(alias, cls, spec, node, kwargs)
+
+
+for _items_bl_idname in _ITEMS_NODE_SPECS:
+    register_emitter(_items_bl_idname)(_emit_items_node)
+
+
+def _emit_typed_items_node(node, ctx: EmitContext) -> Expr | _Val | None:
+    """A variable-items node with typed per-item factories, statement-form:
+    one constructor line plus one ``<var>.items.<type>(value, name)`` line
+    per item, binding a handle variable whenever the item's output is read.
+
+    Bails (falls through) when a fixed input the call cannot express is
+    linked, or an item's type has no typed factory method."""
+    spec = _TYPED_ITEMS_NODE_SPECS.get(node.bl_idname)
+    found = _find_cls(node.bl_idname)
+    if spec is None or found is None:
+        return None
+    alias, cls = found
+
+    items = list(getattr(node, spec.collection))
+    method_map = spec.method_map or _SWITCH_METHOD
+    if any(_item_socket_type(item) not in method_map for item in items):
+        return None
+    in_sockets = [s for s in node.inputs if not s.identifier.startswith("__extend__")]
+    out_sockets = [s for s in node.outputs if not s.identifier.startswith("__extend__")]
+    fixed_inputs, item_inputs = (
+        in_sockets[: len(in_sockets) - len(items)],
+        in_sockets[len(in_sockets) - len(items) :],
+    )
+    item_outputs: list[Any]
+    if not spec.item_outputs:
+        item_outputs = [None] * len(items)
+    elif spec.output_pattern is not None:
+        item_outputs = [
+            s for s in out_sockets if re.fullmatch(spec.output_pattern, s.identifier)
+        ]
+    else:
+        item_outputs = out_sockets[len(out_sockets) - len(items) :]
+
+    kwargs = _items_fixed_kwargs(node, ctx, spec, fixed_inputs)
+    if kwargs is None:  # pragma: no cover - every spec'd fixed input is authorable
+        return None
+    if spec.ctor_props:
+        kwargs.update(
+            {name: Lit(value) for name, value in _non_default_props(node, cls).items()}
+        )
+
+    ctx.used_aliases.add(alias)
+    var_name = _make_var(spec.label, ctx.counter)
+    prop_lines = _node_prop_lines(node)
+    # No items, props or consumers → nothing ever references the variable;
+    # prefix it so the generated module passes lint (F841).
+    if not items and not prop_lines and not ctx.outgoing.get(node.name):
+        var_name = "_" + var_name
+    ref = Ref(var_name)
+    ctor = _items_node_ctor(alias, cls, spec, node, kwargs)
+    ctx.pending_lines.append(f"    {ref.name} = {ctor.render()}")
+    for prop_line in prop_lines:
+        ctx.pending_lines.append(f"    {ref.name}.node.{prop_line}")
+
+    outputs: dict[str, Expr] = {
+        ident: Attr(ref, attr) for ident, attr in spec.fixed_outputs
+    }
+    consumed = {link.from_socket.identifier for link in ctx.outgoing.get(node.name, ())}
+    for in_socket, out_socket, item in zip(item_inputs, item_outputs, items):
+        args, kwargs = _item_decl_args(ctx, node, item, in_socket)
+        method = method_map[_item_socket_type(item)]
+        call = Call(f"{ref.name}.items.{method}", args, kwargs)
+        # outputs beside the item's own (a color sample's alpha) are read
+        # off the node by name
+        for extra in out_sockets:
+            if extra.identifier.startswith(f"{getattr(out_socket, 'identifier', '')}_"):
+                outputs[extra.identifier] = Attr(ref, f"o[{_fmt(extra.name)}]")
+        if out_socket is not None and out_socket.identifier in consumed:
+            handle = Ref(_make_var(item.name, ctx.counter))
+            ctx.pending_lines.append(f"    {handle.name} = {call.render()}")
+            outputs[out_socket.identifier] = Attr(handle, "output")
+        else:
+            ctx.pending_lines.append(f"    {call.render()}")
+    return _Val(None, outputs=outputs)
+
+
+for _items_bl_idname in _TYPED_ITEMS_NODE_SPECS:
+    register_emitter(_items_bl_idname)(_emit_typed_items_node)
+
+
+@register_emitter("GeometryNodeCurveSetHandles")
+def _emit_set_handle_type(node, ctx: EmitContext) -> Expr | _Val | None:
+    """``SetHandleType``'s ``left``/``right`` constructor params map to the
+    ``mode`` ENUM_FLAG set, but aren't RNA-named properties, so the generic
+    ``_non_default_props`` can't capture them. Build the normal constructor and
+    append the booleans that reproduce ``node.mode`` (both default to ``True``,
+    matching Blender's native default ``{'LEFT', 'RIGHT'}``)."""
+    call = ctx.constructor(node)
+    if "LEFT" not in node.mode:
+        call.kwargs["left"] = Lit(False)
+    if "RIGHT" not in node.mode:
+        call.kwargs["right"] = Lit(False)
+    return call
+
+
+# ColorRamp constructor param → attribute on ``node.color_ramp``.
+_COLOR_RAMP_SETTINGS = {
+    "color_interpolation": "interpolation",
+    "hue_interpolation": "hue_interpolation",
+    "mode": "color_mode",
+}
+
+
+@register_emitter("ShaderNodeValToRGB")
+def _emit_color_ramp(node, ctx: EmitContext) -> Expr | _Val | None:
+    """ColorRamp's stops and settings live on ``node.color_ramp``, not on the
+    node, so the generic ``_non_default_props`` can't see them. Append
+    ``items=`` and each setting that differs from the constructor's
+    default."""
+    call = ctx.constructor(node)
+    ramp = node.color_ramp
+    found = _find_cls(node.bl_idname)
+    assert found is not None
+    params = _signature(found[1].__init__).parameters
+    stops = tuple((element.position, tuple(element.color)) for element in ramp.elements)
+    if _norm_floats(stops) != _norm_floats(params["items"].default):
+        call.kwargs["items"] = Lit(stops)
+    for param, attr in _COLOR_RAMP_SETTINGS.items():
+        value = getattr(ramp, attr)
+        if value != params[param].default:
+            call.kwargs[param] = Lit(value)
+    return call
+
+
+@register_emitter("ShaderNodeFloatCurve")
+def _emit_float_curve(node, ctx: EmitContext) -> Expr | _Val | None:
+    """FloatCurve's points live on ``node.mapping``: append ``items=`` when
+    they differ from the constructor's default, with a point's handle type
+    only when it isn't ``AUTO``. The mapping's other settings are written
+    after the constructor by ``_node_mapping_lines``."""
+    call = ctx.constructor(node)
+    found = _find_cls(node.bl_idname)
+    assert found is not None
+    default = _signature(found[1].__init__).parameters["items"].default
+    points = tuple(
+        tuple(point.location)
+        if point.handle_type == "AUTO"
+        else (*point.location, point.handle_type)
+        for point in node.mapping.curves[0].points
+    )
+    if _norm_floats(points) != _norm_floats(default):
+        call.kwargs["items"] = Lit(points)
+    return call
+
+
+@register_emitter("NodeReroute")
+def _emit_reroute(node, ctx: EmitContext) -> Expr | _Val | None:
+    """A reroute (only kept in the graph under ``keep_reroutes``) is a
+    pass-through: emit ``g.Reroute(input=<socket>)``. The source is forced to a
+    socket expression so the runtime links it directly — ``tree.link`` skips
+    type-compat for reroutes — rather than the colour-typed ``input=`` kwarg
+    best-matching against the reroute's default socket and failing."""
+    reroute = _tree_alias(ctx, "Reroute")
+    link = ctx.input_link(node, node.inputs[0].identifier)
+    if link is None:
+        return Call(reroute)
+    return Call(reroute, kwargs={"input": ctx.socket_expr(link)})
+
+
+def _bundle_item_call(
+    receiver: str,
+    item,
+    args: list[Expr],
+    method_map: dict[str, str],
+    kwargs: dict[str, Expr] | None = None,
+) -> Call:
+    """One typed-factory declaration call for a bundle/closure item."""
+    kwargs = dict(kwargs or {})
+    if getattr(item, "structure_type", "AUTO") != "AUTO":
+        kwargs["structure_type"] = Lit(item.structure_type)
+    return Call(f"{receiver}.{method_map[item.socket_type]}", args, kwargs)
+
+
+def _item_decl_args(
+    ctx: EmitContext, node, item, socket
+) -> tuple[list[Expr], dict[str, Expr]]:
+    """Declaration arguments for one value-taking item: the linked source
+    or a significant literal default first, then the name, which becomes
+    the ``name=`` keyword when there is no value."""
+    return _decl_args(ctx.input_link(node, socket.identifier), socket, item.name, ctx)
+
+
+def _decl_args(
+    link: _Link | None, default_socket, name: str, ctx: EmitContext
+) -> tuple[list[Expr], dict[str, Expr]]:
+    value: Expr | None = None
+    if link is not None:
+        value = _zone_value_expr(ctx, link)
+    elif default_socket is not None:
+        default = _significant_default(default_socket)
+        if default is not None:
+            value = Lit(default)
+    if value is None:
+        return [], {"name": Lit(name)}
+    return [value, Lit(name)], {}
+
+
+def _combine_bundle_dict(node, ctx: EmitContext) -> Expr:
+    """Fallback: ``g.CombineBundle(items={name: source})``. Unlinked items
+    declare their socket type as a string."""
+    items: dict[str, Expr] = {}
+    for socket, item in zip(
+        (s for s in node.inputs if not s.identifier.startswith("__extend__")),
+        node.bundle_items,
+    ):
+        link = ctx.input_link(node, socket.identifier)
+        items[socket.name] = (
+            ctx.upstream_expr(link) if link is not None else Lit(item.socket_type)
+        )
+    kwargs: dict[str, Expr] = {"items": DictExpr(items)}
+    if node.define_signature:
+        kwargs["define_signature"] = Lit(True)
+    return Call(_tree_alias(ctx, "CombineBundle"), kwargs=kwargs)
+
+
+@register_emitter("NodeCombineBundle")
+def _emit_combine_bundle(node, ctx: EmitContext) -> Expr | _Val | None:
+    """CombineBundle's inputs are its bundle items: emit the constructor
+    plus one typed ``.items.<type>(value, name)`` line per item, preserving
+    unlinked defaults and non-AUTO structure types. Falls back to the
+    items-dict constructor for item types without a typed factory."""
+    items = list(node.bundle_items)
+    if any(item.socket_type not in _SWITCH_METHOD for item in items):
+        return _combine_bundle_dict(node, ctx)
+    kwargs: dict[str, Expr] = {}
+    if node.define_signature:
+        kwargs["define_signature"] = Lit(True)
+    var_name = _make_var("combine_bundle", ctx.counter)
+    if not items and not ctx.outgoing.get(node.name):
+        var_name = "_" + var_name  # dangling and item-less → never referenced
+    ref = Ref(var_name)
+    ctor = Call(_tree_alias(ctx, "CombineBundle"), kwargs=kwargs)
+    ctx.pending_lines.append(f"    {ref.name} = {ctor.render()}")
+    for socket, item in zip(_prefixed_sockets(node, "Item_"), items):
+        args, kwargs = _item_decl_args(ctx, node, item, socket)
+        call = _bundle_item_call(
+            f"{ref.name}.items", item, args, _SWITCH_METHOD, kwargs
+        )
+        ctx.pending_lines.append(f"    {call.render()}")
+    return _Val(None, outputs={"Bundle": Attr(ref, "o.bundle")})
+
+
+def _separate_bundle_dict(node, ctx: EmitContext) -> Expr:
+    """Fallback: ``g.SeparateBundle(bundle, items={name: "TYPE"})``; items
+    are read back via ``.o[name]``."""
+    items: dict[str, Expr] = {
+        item.name: Lit(item.socket_type) for item in node.bundle_items
+    }
+    bundle_link = ctx.input_link(node, "Bundle")
+    args = [ctx.upstream_expr(bundle_link)] if bundle_link is not None else []
+    kwargs: dict[str, Expr] = {"items": DictExpr(items)}
+    if node.define_signature:
+        kwargs["define_signature"] = Lit(True)
+    return Call(_tree_alias(ctx, "SeparateBundle"), args, kwargs)
+
+
+@register_emitter("NodeSeparateBundle")
+def _emit_separate_bundle(node, ctx: EmitContext) -> Expr | _Val | None:
+    """SeparateBundle's outputs are its bundle items: emit the constructor
+    plus one typed ``.items.<type>(name)`` line per item, binding a handle
+    variable whenever the item's output is read. Falls back to the
+    items-dict constructor for item types without a typed factory."""
+    items = list(node.bundle_items)
+    if any(item.socket_type not in _SWITCH_METHOD for item in items):
+        return _separate_bundle_dict(node, ctx)
+    bundle_link = ctx.input_link(node, "Bundle")
+    args = [ctx.upstream_expr(bundle_link)] if bundle_link is not None else []
+    kwargs: dict[str, Expr] = {}
+    if node.define_signature:
+        kwargs["define_signature"] = Lit(True)
+    var_name = _make_var("separate_bundle", ctx.counter)
+    if not items:
+        var_name = "_" + var_name  # no item lines → never referenced
+    ref = Ref(var_name)
+    ctor = Call(_tree_alias(ctx, "SeparateBundle"), args, kwargs)
+    ctx.pending_lines.append(f"    {ref.name} = {ctor.render()}")
+    outputs: dict[str, Expr] = {}
+    consumed = {link.from_socket.identifier for link in ctx.outgoing.get(node.name, ())}
+    for socket, item in zip(_prefixed_sockets(node, "Item_", output=True), items):
+        call = _bundle_item_call(
+            f"{ref.name}.items", item, [Lit(item.name)], _SWITCH_METHOD
+        )
+        if socket.identifier in consumed:
+            handle = Ref(_make_var(item.name, ctx.counter))
+            ctx.pending_lines.append(f"    {handle.name} = {call.render()}")
+            outputs[socket.identifier] = Attr(handle, "output")
+        else:
+            ctx.pending_lines.append(f"    {call.render()}")
+    return _Val(None, outputs=outputs)
+
+
+def _closure_to_list_kwargs(node, ctx: EmitContext) -> dict[str, Expr]:
+    """The fixed ``count``/``closure`` kwargs for a Closure to List call."""
+    kwargs: dict[str, Expr] = {}
+    count_link = ctx.input_link(node, "Count")
+    if count_link is not None:
+        kwargs["count"] = ctx.upstream_expr(count_link)
+    else:
+        socket = _input_socket_by_identifier(node, "Count")
+        fresh = _get_blender_socket_defaults(
+            ctx.node_tree.bl_idname, node.bl_idname
+        ).get("Count")
+        if socket is not None and not _eq(socket.default_value, fresh):
+            kwargs["count"] = Lit(socket.default_value)
+    closure_link = ctx.input_link(node, "Closure")
+    if closure_link is not None:
+        kwargs["closure"] = ctx.upstream_expr(closure_link)
+    return kwargs
+
+
+def _closure_to_list_dict(node, ctx: EmitContext) -> Expr:  # pragma: no cover
+    """Fallback: ``g.ClosureToList(count, closure, items={name: "TYPE"})``;
+    items are read back via ``.o[name]`` (see the caller's guard)."""
+    kwargs = _closure_to_list_kwargs(node, ctx)
+    kwargs["items"] = DictExpr(
+        {item.name: Lit(item.socket_type) for item in node.list_items}
+    )
+    return Call("g.ClosureToList", kwargs=kwargs)
+
+
+@register_emitter("GeometryNodeClosureToList")
+def _emit_closure_to_list(node, ctx: EmitContext) -> Expr | _Val | None:
+    """Closure to List's outputs are its list items: emit the constructor
+    plus one typed ``.items.<type>(name)`` line per item, binding a handle
+    variable whenever the item's output is read. Items must be declared —
+    Blender only syncs them from the linked closure's signature on an editor
+    update, which a headless rebuild never runs. Falls back to the items-dict
+    constructor for item types without a typed factory."""
+    items = list(node.list_items)
+    ctx.used_aliases.add("g")
+    if any(  # pragma: no cover - guards item types a future Blender may add
+        item.socket_type not in _SWITCH_METHOD for item in items
+    ):
+        return _closure_to_list_dict(node, ctx)
+    var_name = _make_var("closure_to_list", ctx.counter)
+    if not items:
+        var_name = "_" + var_name  # no item lines → never referenced
+    ref = Ref(var_name)
+    ctor = Call("g.ClosureToList", kwargs=_closure_to_list_kwargs(node, ctx))
+    ctx.pending_lines.append(f"    {ref.name} = {ctor.render()}")
+    outputs: dict[str, Expr] = {}
+    consumed = {link.from_socket.identifier for link in ctx.outgoing.get(node.name, ())}
+    for socket, item in zip(_prefixed_sockets(node, "List_", output=True), items):
+        call = _bundle_item_call(
+            f"{ref.name}.items", item, [Lit(item.name)], _SWITCH_METHOD
+        )
+        if socket.identifier in consumed:
+            handle = Ref(_make_var(item.name, ctx.counter))
+            ctx.pending_lines.append(f"    {handle.name} = {call.render()}")
+            outputs[socket.identifier] = Attr(handle, "output")
+        else:
+            ctx.pending_lines.append(f"    {call.render()}")
+    return _Val(None, outputs=outputs)
+
+
+def _evaluate_closure_dict(node, ctx: EmitContext) -> Expr:
+    """Fallback: ``g.EvaluateClosure(closure, input_items={name: source},
+    output_items={name: "TYPE"})``; results are read back via ``.o[name]``."""
+    input_items: dict[str, Expr] = {}
+    in_sockets = (
+        s
+        for s in node.inputs
+        if s.identifier != "Closure" and not s.identifier.startswith("__extend__")
+    )
+    for socket, item in zip(in_sockets, node.input_items):
+        link = ctx.input_link(node, socket.identifier)
+        input_items[socket.name] = (
+            ctx.upstream_expr(link) if link is not None else Lit(item.socket_type)
+        )
+    output_items: dict[str, Expr] = {
+        item.name: Lit(item.socket_type) for item in node.output_items
+    }
+    closure_link = ctx.input_link(node, "Closure")
+    args = [ctx.upstream_expr(closure_link)] if closure_link is not None else []
+    kwargs: dict[str, Expr] = {}
+    if input_items:
+        kwargs["input_items"] = DictExpr(input_items)
+    if output_items:
+        kwargs["output_items"] = DictExpr(output_items)
+    if node.define_signature:
+        kwargs["define_signature"] = Lit(True)
+    return Call(_tree_alias(ctx, "EvaluateClosure"), args, kwargs)
+
+
+@register_emitter("NodeEvaluateClosure")
+def _emit_evaluate_closure(node, ctx: EmitContext) -> Expr | _Val | None:
+    """EvaluateClosure feeds values into a closure and reads results: emit
+    the constructor plus one typed ``.inputs.<type>(value, name)`` line per
+    input item and one ``.outputs.<type>(name)`` line per output item, whose
+    handle's ``.output`` is the result socket. Falls back to the items-dict
+    constructor for item types without a typed factory."""
+    in_items = list(node.input_items)
+    out_items = list(node.output_items)
+    if any(i.socket_type not in _SWITCH_METHOD for i in in_items + out_items):
+        return _evaluate_closure_dict(node, ctx)
+    closure_link = ctx.input_link(node, "Closure")
+    args = [ctx.upstream_expr(closure_link)] if closure_link is not None else []
+    kwargs: dict[str, Expr] = {}
+    if node.define_signature:
+        kwargs["define_signature"] = Lit(True)
+    var_name = _make_var("evaluate_closure", ctx.counter)
+    if not in_items and not out_items:
+        var_name = "_" + var_name  # no item lines → never referenced
+    ref = Ref(var_name)
+    ctor = Call(_tree_alias(ctx, "EvaluateClosure"), args, kwargs)
+    ctx.pending_lines.append(f"    {ref.name} = {ctor.render()}")
+    for socket, item in zip(_prefixed_sockets(node, "Item_"), in_items):
+        args, kwargs = _item_decl_args(ctx, node, item, socket)
+        call = _bundle_item_call(
+            f"{ref.name}.inputs", item, args, _SWITCH_METHOD, kwargs
+        )
+        ctx.pending_lines.append(f"    {call.render()}")
+    outputs: dict[str, Expr] = {}
+    consumed = {link.from_socket.identifier for link in ctx.outgoing.get(node.name, ())}
+    for socket, item in zip(_prefixed_sockets(node, "Item_", output=True), out_items):
+        call = _bundle_item_call(
+            f"{ref.name}.outputs", item, [Lit(item.name)], _SWITCH_METHOD
+        )
+        if socket.identifier in consumed:
+            handle = Ref(_make_var(item.name, ctx.counter))
+            ctx.pending_lines.append(f"    {handle.name} = {call.render()}")
+            outputs[socket.identifier] = Attr(handle, "output")
+        else:
+            ctx.pending_lines.append(f"    {call.render()}")
+    return _Val(None, outputs=outputs)
+
+
+# ---------------------------------------------------------------------------
+# Node group emitter (recursive)
+# ---------------------------------------------------------------------------
+
+
+def _group_input_defaults(node_tree) -> dict[str, Any]:
+    """Interface input socket identifier → default value, for deciding which
+    unlinked group inputs differ from the group's own defaults."""
+    defaults: dict[str, Any] = {}
+    for item in node_tree.interface.items_tree:
+        if getattr(item, "item_type", "") != "SOCKET" or item.in_out != "INPUT":
+            continue
+        if not hasattr(item, "default_value"):
+            continue
+        value = item.default_value
+        try:
+            value = tuple(value)
+        except TypeError:
+            pass
+        defaults[item.identifier] = value
+    return defaults
+
+
+def _emit_group_node(node, ctx: EmitContext) -> Expr | _Val | None:
+    """A group node becomes ``GeneratedClass(**{"Socket": value, ...})``; the
+    inner tree is emitted as a ``CustomGroup`` subclass on the collector.
+
+    Only linked inputs and unlinked inputs whose value differs from the
+    group's own interface default are passed — the rest come from the
+    rebuilt interface."""
+    inner = node.node_tree
+    if inner is None or ctx.collector is None:
+        return None  # unknown group → fall through to the unsupported path
+    iface_defaults = _group_input_defaults(inner)
+
+    # A typed class (merged dump) declares one parameter per input socket, so
+    # calls use its normalized parameter names — the mapping is shared with
+    # the typed __init__ generator via typed_param_names, both derived from
+    # the same live tree.
+    typed_params: dict[str, str] | None = None
+    if (referenced := ctx.collector.reference(node)) is not None:
+        class_name, typed_params = referenced
+    else:
+        class_name = ctx.collector.register(inner)
+        if inner.name in ctx.collector.typed_groups:
+            from ..builder._utils import typed_param_names
+
+            typed_params = typed_param_names(node.inputs)
+
+    # _establish_links matches a kwarg key against socket names. A name shared
+    # by several interface sockets (a group may declare two "Scale" inputs) is
+    # ambiguous as a dict key — and the raw identifier (Socket_6) is an
+    # authoring-history artifact that the rebuilt group reassigns, so it can't
+    # be used either. Such inputs ride in ``named_links`` as (name, value)
+    # pairs (interface order preserved) and resolve by name + type at link time.
+    names = [s.name for s in node.inputs if not s.identifier.startswith("__extend__")]
+
+    items: dict[str, Expr] = {}
+    named_links: list[tuple[str, Expr]] = []
+
+    def _add(socket, value: Expr) -> None:
+        if typed_params is not None:
+            items[typed_params[socket.identifier]] = value
+        elif names.count(socket.name) > 1:
+            named_links.append((socket.name, value))
+        else:
+            items[socket.name] = value
+
+    for socket in node.inputs:
+        if socket.identifier.startswith("__extend__"):
+            continue
+        link = ctx.input_link(node, socket.identifier)
+        if link is not None:
+            _add(socket, ctx.upstream_expr(link))
+            continue
+        if not hasattr(socket, "default_value"):
+            continue
+        current = socket.default_value
+        try:
+            current = tuple(current)
+        except TypeError:
+            pass
+        iface_default = iface_defaults.get(socket.identifier, _UNSET)
+        if iface_default is _UNSET or not _eq(current, iface_default):
+            _add(socket, Lit(socket.default_value))
+    return GroupCall(class_name, items, named_links)
+
+
+for _group_bl_idname in _GROUP_BASES:
+    register_emitter(_group_bl_idname)(_emit_group_node)
+
+
+# ---------------------------------------------------------------------------
+# Zone emitters
+#
+# Paired zone nodes (Simulation/Repeat/ForEachGeometryElement) cannot be
+# expressed as two independent constructors: the wrapper owns the pairing
+# and the shared item collections. The input-node emitter declares the zone
+# wrapper plus one typed-factory handle line per item (``zone.items.float``,
+# ``zone.main_items.vector``, …) and dissolves the
+# input node into per-output handle expressions (``h.current``); the
+# output-node emitter renders its incoming links as ``expr >> h.next``
+# statements at its own topological position and dissolves into
+# ``h.result`` expressions. _topo_sort() adds a synthetic input→output
+# edge so the input node is always visited first. Item handle lines are
+# emitted in original creation order (the numeric suffix of the socket
+# identifier) so the rebuilt zone assigns identical socket identifiers.
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class _ZoneState:
+    """Per-zone emission state handed from the input to the output emitter."""
+
+    targets: dict[str, Expr]  # output-node input identifier → ``>>`` target
+    outputs: dict[str, Expr]  # output-node output identifier → expression
+
+
+def _prefixed_sockets(node, prefix: str, *, output: bool = False) -> list:
+    sockets = node.outputs if output else node.inputs
+    return [s for s in sockets if s.identifier.startswith(prefix)]
+
+
+def _item_socket_type(item) -> str:
+    return getattr(item, "socket_type", None) or item.data_type
+
+
+def _significant_default(socket) -> Any | None:
+    """The socket's default value if it is worth emitting, else None."""
+    if not hasattr(socket, "default_value"):
+        return None
+    try:
+        value = socket.default_value
+    except Exception:  # noqa: BLE001
+        return None
+    if isinstance(value, str):
+        return value or None
+    if value is None or _is_zero(value):
+        return None
+    try:
+        return tuple(value)
+    except TypeError:
+        return value
+
+
+def _zone_item_method(namespace: str, item) -> str:
+    """The typed factory attribute path for an item declaration, e.g.
+    ``items.geometry`` — the factory encodes the socket type, so no
+    ``type=`` kwarg is ever needed."""
+    return f"{namespace}.{_SWITCH_METHOD[_item_socket_type(item)]}"
+
+
+def _zone_value_expr(ctx: EmitContext, link: _Link) -> Expr:
+    """Upstream expression for an item value; pinned to the exact output
+    socket when the source node has several, so the rebuilt link cannot
+    drift to a different best-compatible output."""
+    real_outputs = [s for s in link.from_node.outputs if s.enabled]
+    if len(real_outputs) > 1:
+        return ctx.socket_expr(link)
+    return ctx.upstream_expr(link)
+
+
+def _zone_required(node) -> Any:
+    paired = getattr(node, "paired_output", None)
+    if paired is None:
+        raise CodegenError(
+            f"zone input node '{node.name}' has no paired output — the tree "
+            "cannot be expressed with a zone wrapper"
+        )
+    return paired
+
+
+class _ZoneItemPlan(NamedTuple):
+    """One ``zone.<method>(...)`` declaration line plus its socket roles."""
+
+    method: str  # typed factory path, e.g. "items.geometry" / "main.float"
+    item: Any
+    value_link: _Link | None  # link supplying the declaration's value=
+    default_socket: Any | None  # socket probed for a literal default
+    extra_kwargs: dict[str, Expr]
+    current_id: str | None  # input-node output identifier (read in body)
+    next_id: str | None  # output-node input identifier (>> target)
+    result_id: str | None  # output-node output identifier (read after)
+    roles: tuple[str, str, str]  # expr attr names for the three sockets
+
+
+def _emit_zone_items(
+    ctx: EmitContext,
+    zone_ref: Ref,
+    node,
+    out_node,
+    plans: list[_ZoneItemPlan],
+) -> tuple[dict[str, Expr], dict[str, Expr], dict[str, Expr]]:
+    """Emit handle declaration lines and build the three socket-role maps."""
+    consumed_current = {
+        link.from_socket.identifier for link in ctx.outgoing.get(node.name, ())
+    }
+    linked_next = {
+        link.to_socket.identifier for link in ctx.incoming.get(out_node.name, ())
+    }
+    consumed_result = {
+        link.from_socket.identifier for link in ctx.outgoing.get(out_node.name, ())
+    }
+
+    current_map: dict[str, Expr] = {}
+    targets: dict[str, Expr] = {}
+    outputs: dict[str, Expr] = {}
+    # Emit in plan (item-collection) order: the rebuild recreates the
+    # collection in emission order, and socket identifiers carry creation
+    # counters that stop matching the collection after a UI reorder — sorting
+    # by them would rebuild reordered items in their original positions.
+    for plan in plans:
+        args, kwargs = _decl_args(
+            plan.value_link, plan.default_socket, plan.item.name, ctx
+        )
+        kwargs.update(plan.extra_kwargs)
+        call = Call(f"{zone_ref.name}.{plan.method}", args, kwargs)
+
+        needed = (
+            plan.current_id in consumed_current
+            or plan.next_id in linked_next
+            or plan.result_id in consumed_result
+        )
+        if needed:
+            handle = Ref(_make_var(plan.item.name, ctx.counter))
+            ctx.pending_lines.append(f"    {handle.name} = {call.render()}")
+            current_attr, next_attr, result_attr = plan.roles
+            if plan.current_id is not None:
+                current_map[plan.current_id] = Attr(handle, current_attr)
+            if plan.next_id is not None:
+                targets[plan.next_id] = Attr(handle, next_attr)
+            if plan.result_id is not None:
+                outputs[plan.result_id] = Attr(handle, result_attr)
+        else:
+            ctx.pending_lines.append(f"    {call.render()}")
+    return current_map, targets, outputs
+
+
+def _emit_state_zone_input(
+    node,
+    ctx: EmitContext,
+    *,
+    ctor: str,
+    label: str,
+    items_attr: str,
+    special_outputs: dict[str, str],
+    ctor_args: list[Expr],
+    extra_targets: dict[str, str],
+) -> _Val:
+    """Shared input-node emitter for simulation/repeat zones."""
+    out_node = _zone_required(node)
+    zone_ref = Ref(_make_var(label, ctx.counter))
+    ctor = _tree_alias(ctx, ctor)
+    ctx.pending_lines.append(f"    {zone_ref.name} = {Call(ctor, ctor_args).render()}")
+    if inspection := getattr(out_node, "inspection_index", 0):
+        # Which iteration the spreadsheet inspects — zone-output state no
+        # constructor argument carries.
+        ctx.pending_lines.append(
+            f"    {zone_ref.name}.output.node.inspection_index = {inspection}"
+        )
+
+    items = list(getattr(out_node, items_attr))
+    in_inputs = _prefixed_sockets(node, "Item_")
+    in_outputs = _prefixed_sockets(node, "Item_", output=True)
+    out_inputs = _prefixed_sockets(out_node, "Item_")
+    out_outputs = _prefixed_sockets(out_node, "Item_", output=True)
+
+    plans = [
+        _ZoneItemPlan(
+            method=_zone_item_method("items", item),
+            item=item,
+            value_link=ctx.input_link(node, in_inputs[i].identifier),
+            default_socket=in_inputs[i],
+            extra_kwargs={},
+            current_id=in_outputs[i].identifier,
+            next_id=out_inputs[i].identifier,
+            result_id=out_outputs[i].identifier,
+            roles=("current", "next", "result"),
+        )
+        for i, item in enumerate(items)
+    ]
+    current_map, targets, outputs = _emit_zone_items(
+        ctx, zone_ref, node, out_node, plans
+    )
+    for identifier, attr in special_outputs.items():
+        current_map[identifier] = Attr(zone_ref, attr)
+    for identifier, attr in extra_targets.items():
+        targets[identifier] = Attr(zone_ref, attr)
+
+    ctx.zones[out_node.name] = _ZoneState(targets, outputs)
+    return _Val(None, outputs=current_map)
+
+
+@register_emitter("GeometryNodeSimulationInput")
+def _emit_simulation_input(node, ctx: EmitContext) -> _Val:
+    return _emit_state_zone_input(
+        node,
+        ctx,
+        ctor="SimulationZone",
+        label="simulation_zone",
+        items_attr="state_items",
+        special_outputs={"Delta Time": "delta_time"},
+        ctor_args=[],
+        extra_targets={"Skip": "output.i.skip"},
+    )
+
+
+@register_emitter("GeometryNodeRepeatInput")
+def _emit_repeat_input(node, ctx: EmitContext) -> _Val:
+    ctor_args: list[Expr] = []
+    link = ctx.input_link(node, "Iterations")
+    if link is not None:
+        ctor_args.append(_zone_value_expr(ctx, link))
+    else:
+        iterations = node.inputs["Iterations"].default_value
+        if iterations != 1:
+            ctor_args.append(Lit(iterations))
+    return _emit_state_zone_input(
+        node,
+        ctx,
+        ctor="RepeatZone",
+        label="repeat_zone",
+        items_attr="repeat_items",
+        special_outputs={"Iteration": "iteration"},
+        ctor_args=ctor_args,
+        extra_targets={},
+    )
+
+
+@register_emitter("GeometryNodeForeachGeometryElementInput")
+def _emit_foreach_input(node, ctx: EmitContext) -> _Val:
+    out_node = _zone_required(node)
+    ctx.used_aliases.add("g")
+
+    kwargs: dict[str, Expr] = {}
+    geometry_link = ctx.input_link(node, "Geometry")
+    if geometry_link is not None:
+        kwargs["geometry"] = _zone_value_expr(ctx, geometry_link)
+    selection_link = ctx.input_link(node, "Selection")
+    if selection_link is not None:
+        kwargs["selection"] = _zone_value_expr(ctx, selection_link)
+    elif node.inputs["Selection"].default_value is not True:
+        kwargs["selection"] = Lit(node.inputs["Selection"].default_value)
+    # The domain is spelled as the class-method factory, as for CaptureAttribute.
+    ctor = "g.ForEachGeometryElementZone"
+    if out_node.domain != "POINT":
+        ctor += f".{out_node.domain.lower()}"
+    zone_ref = Ref(_make_var("for_each", ctx.counter))
+    ctx.pending_lines.append(
+        f"    {zone_ref.name} = {Call(ctor, kwargs=kwargs).render()}"
+    )
+
+    generation_items = list(out_node.generation_items)
+    if (
+        not generation_items
+        or generation_items[0].socket_type != "GEOMETRY"
+        or generation_items[0].name != "Geometry"
+    ):
+        raise CodegenError(
+            f"foreach zone '{node.name}': the first generation item is not "
+            "the default Geometry item, which the zone wrapper cannot rebuild"
+        )
+
+    plans: list[_ZoneItemPlan] = []
+    in_inputs = _prefixed_sockets(node, "Input_")
+    in_outputs = _prefixed_sockets(node, "Input_", output=True)
+    for i, item in enumerate(out_node.input_items):
+        plans.append(
+            _ZoneItemPlan(
+                method=_zone_item_method("items", item),
+                item=item,
+                value_link=ctx.input_link(node, in_inputs[i].identifier),
+                default_socket=in_inputs[i],
+                extra_kwargs={},
+                current_id=in_outputs[i].identifier,
+                next_id=None,
+                result_id=None,
+                roles=("output", "", ""),
+            )
+        )
+    main_inputs = _prefixed_sockets(out_node, "Main_")
+    main_outputs = _prefixed_sockets(out_node, "Main_", output=True)
+    for i, item in enumerate(out_node.main_items):
+        plans.append(
+            _ZoneItemPlan(
+                method=_zone_item_method("main_items", item),
+                item=item,
+                value_link=None,
+                default_socket=main_inputs[i],
+                extra_kwargs={},
+                current_id=None,
+                next_id=main_inputs[i].identifier,
+                result_id=main_outputs[i].identifier,
+                roles=("", "input", "output"),
+            )
+        )
+    gen_inputs = _prefixed_sockets(out_node, "Generation_")
+    gen_outputs = _prefixed_sockets(out_node, "Generation_", output=True)
+    for i, item in enumerate(generation_items):
+        if i == 0:
+            continue  # the wrapper creates the default Geometry item itself
+        extra: dict[str, Expr] = {}
+        if item.domain != "POINT":
+            extra["domain"] = Lit(item.domain)
+        plans.append(
+            _ZoneItemPlan(
+                method=_zone_item_method("generated_items", item),
+                item=item,
+                value_link=None,
+                default_socket=gen_inputs[i],
+                extra_kwargs=extra,
+                current_id=None,
+                next_id=gen_inputs[i].identifier,
+                result_id=gen_outputs[i].identifier,
+                roles=("", "input", "output"),
+            )
+        )
+
+    current_map, targets, outputs = _emit_zone_items(
+        ctx, zone_ref, node, out_node, plans
+    )
+    current_map["Index"] = Attr(zone_ref, "index")
+    current_map["Element"] = Attr(zone_ref, "input.o.element")
+    targets[gen_inputs[0].identifier] = Attr(zone_ref, "generation.input")
+    outputs[gen_outputs[0].identifier] = Attr(zone_ref, "generation.output")
+    outputs["Geometry"] = Attr(zone_ref, "output")
+
+    ctx.zones[out_node.name] = _ZoneState(targets, outputs)
+    return _Val(None, outputs=current_map)
+
+
+@register_emitter("GeometryNodeSimulationOutput")
+@register_emitter("GeometryNodeRepeatOutput")
+@register_emitter("GeometryNodeForeachGeometryElementOutput")
+def _emit_zone_output(node, ctx: EmitContext) -> _Val:
+    """Render incoming links as ``expr >> target`` statements and dissolve
+    the output node into the result expressions prepared by the input
+    emitter."""
+    state = ctx.zones.pop(node.name, None)
+    if state is None:
+        raise CodegenError(
+            f"zone output node '{node.name}' was emitted before its paired "
+            "input node — is the zone paired?"
+        )
+    order = {s.identifier: i for i, s in enumerate(node.inputs)}
+    links = sorted(
+        ctx.incoming.get(node.name, ()),
+        key=lambda link: order.get(link.to_socket.identifier, 0),
+    )
+    for link in links:
+        target = state.targets.get(link.to_socket.identifier)
+        if target is None:
+            raise CodegenError(
+                f"zone output node '{node.name}' has a link into "
+                f"'{link.to_socket.name}' with no emit target"
+            )
+        statement = BinOp(">>", ctx.upstream_expr(link, pipeline=True), target)
+        ctx.pending_lines.extend(_stmt_lines(statement))
+    return _Val(None, outputs=state.outputs)
+
+
+def _closure_item_call(zone_ref: Ref, namespace: str, item) -> Call:
+    kwargs: dict[str, Expr] = {}
+    if getattr(item, "structure_type", "AUTO") != "AUTO":
+        kwargs["structure_type"] = Lit(item.structure_type)
+    if _item_socket_type(item) not in _SWITCH_METHOD:
+        # no typed factory for this socket type — use the runtime-typed form
+        kwargs["type"] = Lit(_item_socket_type(item))
+        return Call(f"{zone_ref.name}.{namespace}.new", [Lit(item.name)], kwargs)
+    return Call(
+        f"{zone_ref.name}.{_zone_item_method(namespace, item)}",
+        [Lit(item.name)],
+        kwargs,
+    )
+
+
+@register_emitter("NodeClosureInput")
+def _emit_closure_input(node, ctx: EmitContext) -> _Val:
+    """Closure zone: declare ``cz = g.ClosureZone()`` plus one
+    ``cz.inputs.<type>(name)`` line per input item (read in the body through
+    the handle's ``.output``) and prepare ``cz.outputs.<type>(name)`` handles
+    whose ``.input`` is the ``>>`` target for each output item.
+    The input node dissolves into the input-item read expressions; the paired
+    output node (``_emit_zone_output``) renders body links as ``expr >> target``
+    and dissolves into the ``cz.closure`` result.
+
+    Items live on the output node (``input_items`` / ``output_items``) and drive
+    the input node's outputs and the output node's inputs respectively."""
+    out_node = _zone_required(node)
+    zone_ref = Ref(_make_var("closure_zone", ctx.counter))
+    closure_zone = _tree_alias(ctx, "ClosureZone")
+    ctx.pending_lines.append(f"    {zone_ref.name} = {Call(closure_zone).render()}")
+
+    # Input items → readable sockets on the input node's outputs.
+    consumed = {link.from_socket.identifier for link in ctx.outgoing.get(node.name, ())}
+    in_outputs = _prefixed_sockets(node, "Item_", output=True)
+    current_map: dict[str, Expr] = {}
+    for socket, item in zip(in_outputs, out_node.input_items):
+        call = _closure_item_call(zone_ref, "inputs", item)
+        if socket.identifier in consumed:
+            handle = Ref(_make_var(item.name, ctx.counter))
+            ctx.pending_lines.append(f"    {handle.name} = {call.render()}")
+            current_map[socket.identifier] = Attr(handle, "output")
+        else:
+            ctx.pending_lines.append(f"    {call.render()}")
+
+    # Output items → ``>>`` targets on the output node's inputs.
+    linked_next = {
+        link.to_socket.identifier for link in ctx.incoming.get(out_node.name, ())
+    }
+    out_inputs = _prefixed_sockets(out_node, "Item_")
+    targets: dict[str, Expr] = {}
+    for socket, item in zip(out_inputs, out_node.output_items):
+        call = _closure_item_call(zone_ref, "outputs", item)
+        if socket.identifier in linked_next:
+            handle = Ref(_make_var(item.name, ctx.counter))
+            ctx.pending_lines.append(f"    {handle.name} = {call.render()}")
+            targets[socket.identifier] = Attr(handle, "input")
+        else:
+            ctx.pending_lines.append(f"    {call.render()}")
+
+    ctx.zones[out_node.name] = _ZoneState(
+        targets, {"Closure": Attr(zone_ref, "closure")}
+    )
+    return _Val(None, outputs=current_map)
+
+
+register_emitter("NodeClosureOutput")(_emit_zone_output)

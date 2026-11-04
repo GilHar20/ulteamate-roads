@@ -1,0 +1,49 @@
+name: docs-build-deploy
+
+on:
+  workflow_dispatch:
+  push:
+    branches: ["main"]
+    tags: ["v*"]
+  pull_request:
+    branches: ["*"]
+
+jobs:
+  build-docs:
+    runs-on: macos-latest
+    permissions: write-all
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install the latest version of uv
+        uses: astral-sh/setup-uv@v4
+        with:
+          version: "latest"
+      # rendered example images are keyed on the examples, the render script and
+      # nodebpy's source; render.py re-renders only those whose inputs changed
+      - name: Cache example renders
+        uses: actions/cache@v4
+        with:
+          path: docs/examples/images
+          key: example-renders-${{ hashFiles('docs/examples/code/*.py', 'docs/examples/render.py', 'src/nodebpy/**/*.py') }}
+          restore-keys: example-renders-
+
+      - name: Build Docs
+        run: |
+          uv sync --all-extras
+          uv pip install -e .
+          cd docs
+          uv run quartodoc build
+          uv run quartodoc interlinks
+
+      - name: Quarto Render
+        run: |
+          uv run quarto render docs
+
+      # Only publish to GitHub Pages when a new version tag is pushed
+      - name: Publish to GitHub Pages
+        if: startsWith(github.ref, 'refs/tags/v')
+        run: |
+          git config --global user.name "github-actions[bot]"
+          git config --global user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          cd docs
+          uv run quarto publish gh-pages --no-render --no-prompt --no-browser
