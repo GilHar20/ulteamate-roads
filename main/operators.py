@@ -101,13 +101,12 @@ class UTMROADS_OT_draw_road(bpy.types.Operator):
             self.report({"ERROR"}, str(exc))
             return {"CANCELLED"}
 
-        bpy.ops.object.mode_set(mode='EDIT')
-        bpy.ops.curve.select_all(action='SELECT')
-        bpy.ops.curve.delete(type='VERT')
+        bpy.ops.object.mode_set(mode = 'EDIT')
+        bpy.ops.curve.select_all(action = 'SELECT')
+        bpy.ops.curve.delete(type ='VERT')
 
         bpy.ops.view3d.view_axis(type = 'TOP')
-        bpy.ops.wm.tool_set_by_id(name="builtin.draw")
-        #bpy.ops.object.origin_set(type = 'ORIGIN_GEOMETRY')
+        bpy.ops.wm.tool_set_by_id(name = "builtin.draw")
         
         return{"FINISHED"}
     
